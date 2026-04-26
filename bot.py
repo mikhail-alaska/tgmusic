@@ -1,0 +1,788 @@
+#!/usr/bin/env python3
+import io
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Set, Tuple
+from urllib.parse import parse_qs, urlparse
+
+import requests
+from mutagen.easyid3 import EasyID3
+from mutagen.id3 import APIC, ID3
+from mutagen.mp4 import MP4, MP4Cover
+from ytmusicapi import YTMusic
+
+PROXY_URL = "http://127.0.0.1:2080"
+BOT_API_BASE = "https://api.telegram.org"
+ALLOWED_USER_ID = 517539052
+SEARCH_LIMIT = 10
+CONFIDENCE_MIN = 0.60
+YTM_URL = "https://music.youtube.com/watch?v={vid}"
+YT_URL = "https://www.youtube.com/watch?v={vid}"
+YOUTUBE_CLIENTS = ["ios", "tv_embedded", "webremix"]
+POLL_TIMEOUT_S = 30
+
+PENALTY_TERMS = {
+	"live",
+	"remix",
+	"cover",
+	"sped",
+	"slowed",
+	"nightcore",
+	"8d",
+	"reverb",
+	"extended",
+	"mashup",
+	"edit",
+	"karaoke",
+	"instrumental",
+	"demo",
+	"tribute",
+	"soundalike",
+}
+
+
+@dataclass
+class PendingChoice:
+	query: str
+	candidates: List[Dict]
+	created_at: float
+
+
+PENDING_BY_CHAT: Dict[int, PendingChoice] = {}
+
+
+def configure_proxy() -> None:
+	os.environ["HTTP_PROXY"] = PROXY_URL
+	os.environ["HTTPS_PROXY"] = PROXY_URL
+	os.environ["ALL_PROXY"] = PROXY_URL
+	os.environ["http_proxy"] = PROXY_URL
+	os.environ["https_proxy"] = PROXY_URL
+	os.environ["all_proxy"] = PROXY_URL
+
+
+def load_dotenv() -> None:
+	candidates = [
+		pathlib.Path(__file__).resolve().parent / ".env",
+		pathlib.Path(__file__).resolve().parent.parent / ".env",
+		pathlib.Path.cwd() / ".env",
+	]
+	for path in candidates:
+		if not path.exists():
+			continue
+		for raw_line in path.read_text(encoding="utf-8").splitlines():
+			line = raw_line.strip()
+			if not line or line.startswith("#") or "=" not in line:
+				continue
+			key, value = line.split("=", 1)
+			key = key.strip()
+			value = value.strip().strip("'").strip('"')
+			if key and key not in os.environ:
+				os.environ[key] = value
+		return
+
+
+def bot_token() -> str:
+	token = os.environ.get("TG_BOT_TOKEN", "").strip()
+	if not token:
+		raise RuntimeError("Set TG_BOT_TOKEN in .env or in the environment before starting the bot.")
+	return token
+
+
+def session() -> requests.Session:
+	s = requests.Session()
+	s.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
+	return s
+
+
+HTTP = session()
+
+
+def api_url(method: str) -> str:
+	return f"{BOT_API_BASE}/bot{bot_token()}/{method}"
+
+
+def file_api_url(file_token: str) -> str:
+	return f"{BOT_API_BASE}/file/bot{bot_token()}/{file_token}"
+
+
+def api_call(method: str, *, data=None, files=None, timeout: int = 60) -> Dict:
+	resp = HTTP.post(api_url(method), data=data, files=files, timeout=timeout)
+	resp.raise_for_status()
+	payload = resp.json()
+	if not payload.get("ok"):
+		raise RuntimeError(f"Telegram API error in {method}: {payload}")
+	return payload["result"]
+
+
+def get_updates(offset: Optional[int]) -> List[Dict]:
+	resp = HTTP.get(
+		api_url("getUpdates"),
+		params={
+			"offset": offset,
+			"timeout": POLL_TIMEOUT_S,
+			"allowed_updates": json.dumps(["message", "callback_query"]),
+		},
+		timeout=POLL_TIMEOUT_S + 10,
+	)
+	resp.raise_for_status()
+	payload = resp.json()
+	if not payload.get("ok"):
+		raise RuntimeError(f"Telegram API error in getUpdates: {payload}")
+	return payload["result"]
+
+
+def send_message(chat_id: int, text: str, reply_markup: Optional[Dict] = None) -> None:
+	data = {"chat_id": str(chat_id), "text": text}
+	if reply_markup is not None:
+		data["reply_markup"] = json.dumps(reply_markup)
+	api_call("sendMessage", data=data)
+
+
+def send_chat_action(chat_id: int, action: str) -> None:
+	api_call("sendChatAction", data={"chat_id": str(chat_id), "action": action})
+
+
+def answer_callback_query(callback_query_id: str, text: Optional[str] = None, show_alert: bool = False) -> None:
+	data = {"callback_query_id": callback_query_id}
+	if text:
+		data["text"] = text
+	if show_alert:
+		data["show_alert"] = "true"
+	api_call("answerCallbackQuery", data=data)
+
+
+def edit_message_reply_markup(chat_id: int, message_id: int, reply_markup: Optional[Dict] = None) -> None:
+	data = {"chat_id": str(chat_id), "message_id": str(message_id)}
+	if reply_markup is not None:
+		data["reply_markup"] = json.dumps(reply_markup)
+	api_call("editMessageReplyMarkup", data=data)
+
+
+def send_audio(chat_id: int, path: pathlib.Path, title: str, artist: str, cover_bytes: Optional[bytes]) -> None:
+	data = {"chat_id": str(chat_id), "title": title, "performer": artist}
+	files = {"audio": (path.name, path.open("rb"), "audio/mp4")}
+	thumb_handle = None
+	try:
+		if cover_bytes:
+			thumb_handle = io.BytesIO(cover_bytes)
+			thumb_handle.name = "cover.jpg"
+			files["thumbnail"] = ("cover.jpg", thumb_handle, "image/jpeg")
+		api_call("sendAudio", data=data, files=files, timeout=300)
+	finally:
+		audio_handle = files["audio"][1]
+		audio_handle.close()
+		if thumb_handle is not None:
+			thumb_handle.close()
+
+
+def send_video(chat_id: int, path: pathlib.Path, caption: Optional[str] = None) -> None:
+	data = {"chat_id": str(chat_id), "supports_streaming": "true"}
+	if caption:
+		data["caption"] = caption[:1024]
+	files = {"video": (path.name, path.open("rb"), "video/mp4")}
+	try:
+		api_call("sendVideo", data=data, files=files, timeout=300)
+	finally:
+		files["video"][1].close()
+
+
+def toks(text: str) -> Set[str]:
+	return set(re.findall(r"[^\W_]+", (text or "").lower(), flags=re.UNICODE))
+
+
+def overlap_ratio(needle: Set[str], haystack: Set[str]) -> float:
+	return len(needle & haystack) / max(1, len(needle))
+
+
+def duration_s(value: Optional[int | str]) -> int:
+	try:
+		if value is None:
+			return 0
+		if isinstance(value, str):
+			text = value.strip()
+			if not text:
+				return 0
+			if ":" in text:
+				total = 0
+				for part in text.split(":"):
+					total = total * 60 + int(part)
+				return total
+			return int(float(text))
+		return int(value)
+	except Exception:
+		return 0
+
+
+def clean_query(search_query: str) -> str:
+	query = search_query.strip()
+	query = re.sub(r"\s+", " ", query)
+	query = query.replace(" - ", " ")
+	return query
+
+
+def strip_noise(search_query: str) -> str:
+	text = re.sub(r"[\(\[][^\)\]]*[Ff]eat[^\)\]]*[\)\]]", " ", search_query)
+	text = re.sub(r"[\(\[][Oo]fficial[^\)\]]*[\)\]]", " ", text)
+	text = re.sub(r"[\(\[][Ll]ive[^\)\]]*[\)\]]", " ", text)
+	text = re.sub(r"[\(\[][Rr]emix[^\)\]]*[\)\]]", " ", text)
+	text = re.sub(r"[\(\)\[\]]", " ", text)
+	return re.sub(r"\s+", " ", text).strip()
+
+
+def query_variants(search_query: str) -> List[str]:
+	base = clean_query(search_query)
+	cleaned = clean_query(strip_noise(search_query))
+	variants = [base]
+	if cleaned and cleaned != base:
+		variants.append(cleaned)
+	if "&" in base:
+		variants.append(base.replace("&", "and"))
+	if re.search(r"\band\b", base, flags=re.I):
+		variants.append(re.sub(r"\band\b", "&", base, flags=re.I))
+
+	seen = set()
+	out = []
+	for item in variants:
+		value = re.sub(r"\s+", " ", item).strip()
+		if value and value not in seen:
+			seen.add(value)
+			out.append(value)
+	return out
+
+
+def candidate_artist_text(candidate: Dict) -> str:
+	artists = candidate.get("artists")
+	if artists:
+		try:
+			return ", ".join(artist.get("name", "") for artist in artists)
+		except Exception:
+			pass
+	return candidate.get("author", "") or ""
+
+
+def score_candidate(search_query: str, candidate: Dict) -> float:
+	query_tokens = toks(search_query)
+	candidate_title = candidate.get("title") or ""
+	candidate_artist = candidate_artist_text(candidate)
+	title_overlap = overlap_ratio(query_tokens, toks(candidate_title))
+	artist_overlap = overlap_ratio(query_tokens, toks(candidate_artist))
+	yt_duration = duration_s(candidate.get("duration_seconds"))
+	duration_score = 0.7 if yt_duration <= 0 else 1.0
+
+	channel = (candidate.get("author") or "").lower()
+	channel_boost = 0.15 if ("topic" in channel or "official" in channel) else 0.0
+
+	blob = f"{candidate_title} {candidate_artist}".lower()
+	penalty = 0.0
+	for term in PENALTY_TERMS:
+		if term in blob:
+			penalty += 0.10
+
+	total = duration_score * 0.30 + title_overlap * 0.40 + artist_overlap * 0.25 + channel_boost - penalty
+	return max(0.0, min(total, 0.99))
+
+
+def search_filter(yt: YTMusic, query: str, search_filter_name: str, limit: int) -> List[Dict]:
+	results = yt.search(query, filter=search_filter_name, limit=limit) or []
+	candidates: List[Dict] = []
+	source = "music" if search_filter_name == "songs" else "videos"
+	for item in results:
+		video_id = item.get("videoId")
+		if not video_id:
+			continue
+		artists = item.get("artists")
+		candidates.append({
+			"videoId": video_id,
+			"title": item.get("title"),
+			"artists": artists if search_filter_name == "songs" else None,
+			"author": (artists[0]["name"] if artists and search_filter_name == "songs" else item.get("author") or ""),
+			"duration_seconds": duration_s(item.get("duration_seconds") or item.get("duration")),
+			"source": source,
+		})
+	return candidates
+
+
+def find_best(search_query: str) -> Tuple[Optional[Dict], float, List[Dict]]:
+	yt = YTMusic()
+	all_candidates: List[Dict] = []
+	seen_ids: Set[str] = set()
+
+	for query in query_variants(search_query):
+		for search_filter_name in ("songs", "videos"):
+			for candidate in search_filter(yt, query, search_filter_name, SEARCH_LIMIT):
+				video_id = candidate.get("videoId")
+				if not video_id or video_id in seen_ids:
+					continue
+				seen_ids.add(video_id)
+				candidate["score"] = score_candidate(search_query, candidate)
+				all_candidates.append(candidate)
+
+	ranked = sorted(
+		all_candidates,
+		key=lambda item: (item["score"], 1 if item.get("source") == "music" else 0),
+		reverse=True,
+	)
+	if not ranked:
+		return None, 0.0, []
+
+	best = ranked[0]
+	if best["score"] < CONFIDENCE_MIN:
+		return None, best["score"], ranked
+	return best, best["score"], ranked
+
+
+def sanitize_name(name: str) -> str:
+	return re.sub(r'[\\/:*?"<>|]+', "_", name or "").strip()
+
+
+def is_youtube_url(text: str) -> bool:
+	try:
+		parsed = urlparse(text.strip())
+	except Exception:
+		return False
+	host = (parsed.netloc or "").lower()
+	return any(domain in host for domain in ("youtube.com", "youtu.be"))
+
+
+def is_social_video_url(text: str) -> bool:
+	try:
+		parsed = urlparse(text.strip())
+	except Exception:
+		return False
+	host = (parsed.netloc or "").lower()
+	path = parsed.path or ""
+	if any(domain in host for domain in ("tiktok.com", "vm.tiktok.com", "vt.tiktok.com")):
+		return True
+	if "instagram.com" in host and (
+		path.startswith("/reel/")
+		or path.startswith("/reels/")
+		or path.startswith("/p/")
+		or path.startswith("/tv/")
+	):
+		return True
+	return False
+
+
+def extract_youtube_video_id(url: str) -> Optional[str]:
+	try:
+		parsed = urlparse(url.strip())
+	except Exception:
+		return None
+
+	host = (parsed.netloc or "").lower()
+	path = parsed.path or ""
+
+	if "youtu.be" in host:
+		candidate = path.strip("/").split("/")[0]
+		return candidate or None
+
+	if "youtube.com" in host:
+		if path == "/watch":
+			query = parse_qs(parsed.query or "")
+			candidate = (query.get("v") or [None])[0]
+			return candidate or None
+		if path.startswith("/shorts/") or path.startswith("/embed/") or path.startswith("/live/"):
+			parts = [part for part in path.split("/") if part]
+			if len(parts) >= 2:
+				return parts[1]
+	return None
+
+
+def probe_video_metadata(url: str, video_id: str) -> Tuple[str, str]:
+	yt_bin = ytdlp_path()
+	cmd = [
+		yt_bin,
+		"--proxy",
+		PROXY_URL,
+		"--dump-single-json",
+		"--no-playlist",
+		url,
+	]
+	proc = subprocess.run(cmd, capture_output=True, text=True)
+	if proc.returncode != 0:
+		return f"YouTube {video_id}", "YouTube"
+
+	try:
+		payload = json.loads(proc.stdout)
+	except Exception:
+		return f"YouTube {video_id}", "YouTube"
+
+	title = (payload.get("track") or payload.get("title") or f"YouTube {video_id}").strip()
+	artist = (
+		payload.get("artist")
+		or payload.get("uploader")
+		or payload.get("channel")
+		or "YouTube"
+	)
+	return str(title).strip() or f"YouTube {video_id}", str(artist).strip() or "YouTube"
+
+
+def yt_thumbnail_bytes(video_id: str) -> Optional[bytes]:
+	for quality in ("maxresdefault", "sddefault", "hqdefault", "mqdefault", "default"):
+		url = f"https://i.ytimg.com/vi/{video_id}/{quality}.jpg"
+		try:
+			response = HTTP.get(url, timeout=20)
+			if response.status_code == 200 and response.content and len(response.content) > 1024:
+				return response.content
+		except Exception:
+			pass
+	return None
+
+
+def tag_file(path: pathlib.Path, title: str, artist: str, cover_bytes: Optional[bytes]) -> None:
+	if path.suffix.lower() == ".mp3":
+		try:
+			_ = EasyID3(path)
+		except Exception:
+			try:
+				EasyID3.register_text_key("date", "TDRC")
+			except Exception:
+				pass
+			audio = EasyID3()
+			audio.save(path)
+
+		audio = EasyID3(path)
+		audio["title"] = title
+		audio["artist"] = artist
+		audio.save()
+
+		if cover_bytes:
+			id3 = ID3(path)
+			id3.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover_bytes))
+			id3.save(v2_version=3)
+		return
+
+	if path.suffix.lower() in {".m4a", ".mp4"}:
+		audio = MP4(path)
+		audio["\xa9nam"] = [title]
+		audio["\xa9ART"] = [artist]
+		if cover_bytes:
+			audio["covr"] = [MP4Cover(cover_bytes, imageformat=MP4Cover.FORMAT_JPEG)]
+		audio.save()
+
+
+def ytdlp_path() -> str:
+	root = pathlib.Path(__file__).resolve().parent.parent
+	local = root / "yt-dlp"
+	if local.exists():
+		return str(local)
+	return "yt-dlp"
+
+
+def download_audio(video_id: str, title: str, artist: str, out_dir: pathlib.Path) -> pathlib.Path:
+	out_dir.mkdir(parents=True, exist_ok=True)
+	base_name = sanitize_name(f"{artist} - {title}")
+	out_template = str(out_dir / f"{base_name}.%(ext)s")
+	yt_bin = ytdlp_path()
+	last_error = "yt-dlp failed without error output"
+
+	for base_url in (YTM_URL.format(vid=video_id), YT_URL.format(vid=video_id)):
+		for client in YOUTUBE_CLIENTS:
+			cmd = [
+				yt_bin,
+				"-f",
+				"ba[ext=m4a]/bestaudio[ext=m4a]/bestaudio",
+				"--proxy",
+				PROXY_URL,
+				"--no-playlist",
+				"--force-overwrites",
+				"--retries",
+				"5",
+				"--fragment-retries",
+				"5",
+				"--socket-timeout",
+				"30",
+				"--extractor-args",
+				f"youtube:player_client={client}",
+				"-o",
+				out_template,
+				base_url,
+			]
+			proc = subprocess.run(cmd, capture_output=True, text=True)
+			if proc.returncode == 0:
+				files = sorted(out_dir.glob(f"{base_name}.*"), key=lambda path: path.stat().st_mtime, reverse=True)
+				if files:
+					return files[0]
+				raise RuntimeError("yt-dlp reported success but no file was created.")
+			last_error = (proc.stderr or proc.stdout or "").strip()[-500:]
+
+	raise RuntimeError(f"Download failed: {last_error}")
+
+
+def download_social_video(url: str, out_dir: pathlib.Path) -> pathlib.Path:
+	out_dir.mkdir(parents=True, exist_ok=True)
+	out_template = str(out_dir / "social_video.%(ext)s")
+	yt_bin = ytdlp_path()
+	cmd = [
+		yt_bin,
+		"-f",
+		"bv*+ba/b",
+		"--merge-output-format",
+		"mp4",
+		"--proxy",
+		PROXY_URL,
+		"--no-playlist",
+		"--force-overwrites",
+		"--retries",
+		"5",
+		"--fragment-retries",
+		"5",
+		"--socket-timeout",
+		"30",
+		"-o",
+		out_template,
+		url,
+	]
+	proc = subprocess.run(cmd, capture_output=True, text=True)
+	if proc.returncode != 0:
+		detail = (proc.stderr or proc.stdout or "").strip()[-700:]
+		raise RuntimeError(f"yt-dlp failed: {detail}")
+	files = sorted(
+		[path for path in out_dir.iterdir() if path.is_file() and path.name.startswith("social_video.")],
+		key=lambda path: path.stat().st_mtime,
+		reverse=True,
+	)
+	if not files:
+		raise RuntimeError("yt-dlp reported success but no video file was created.")
+	return files[0]
+
+
+def format_candidates(candidates: List[Dict], limit: int = 5) -> str:
+	lines = ["Tap a result button below, or reply with a number:"]
+	for index, candidate in enumerate(candidates[:limit], start=1):
+		title = candidate.get("title") or "Unknown title"
+		artist = candidate_artist_text(candidate) or "Unknown artist"
+		score = candidate.get("score", 0.0)
+		source = candidate.get("source") or "unknown"
+		duration = duration_s(candidate.get("duration_seconds"))
+		duration_text = f"{duration}s" if duration else "unknown duration"
+		lines.append(f"{index}. {artist} - {title} | {duration_text} | {source} | score={score:.2f}")
+	return "\n".join(lines)
+
+
+def candidate_buttons(candidates: List[Dict], limit: int = 5) -> Dict:
+	keyboard = []
+	for index, candidate in enumerate(candidates[:limit], start=1):
+		title = candidate.get("title") or "Unknown title"
+		artist = candidate_artist_text(candidate) or "Unknown artist"
+		button_text = f"{index}. {artist[:20]} - {title[:24]}"
+		keyboard.append([{"text": button_text, "callback_data": f"pick:{index}"}])
+	return {"inline_keyboard": keyboard}
+
+
+def cleanup_old_pending() -> None:
+	now = time.time()
+	for chat_id in list(PENDING_BY_CHAT.keys()):
+		if now - PENDING_BY_CHAT[chat_id].created_at > 900:
+			del PENDING_BY_CHAT[chat_id]
+
+
+def handle_search(chat_id: int, query: str) -> None:
+	send_chat_action(chat_id, "typing")
+	_, confidence, ranked = find_best(query)
+	if not ranked:
+		send_message(chat_id, f"No candidates found for: {query}")
+		return
+
+	PENDING_BY_CHAT[chat_id] = PendingChoice(query=query, candidates=ranked[:5], created_at=time.time())
+	prefix = f"Best automatic match score: {confidence:.2f}\n" if confidence > 0 else ""
+	send_message(chat_id, prefix + format_candidates(ranked, limit=5), reply_markup=candidate_buttons(ranked, limit=5))
+
+
+def handle_choice(chat_id: int, text: str) -> None:
+	pending = PENDING_BY_CHAT.get(chat_id)
+	if not pending:
+		send_message(chat_id, "Send a search query first.")
+		return
+
+	try:
+		index = int(text.strip())
+	except ValueError:
+		send_message(chat_id, "Send a number from the candidate list.")
+		return
+
+	if not (1 <= index <= len(pending.candidates)):
+		send_message(chat_id, "Choice out of range.")
+		return
+
+	selected = pending.candidates[index - 1]
+	video_id = selected.get("videoId")
+	if not video_id:
+		send_message(chat_id, "That candidate has no video id.")
+		return
+
+	title = selected.get("title") or pending.query
+	artist = candidate_artist_text(selected) or "Unknown artist"
+	send_message(chat_id, f"Downloading: {artist} - {title}")
+	send_chat_action(chat_id, "upload_document")
+
+	with tempfile.TemporaryDirectory(prefix="tgmusic-") as tmpdir:
+		tmp_path = pathlib.Path(tmpdir)
+		output_file = download_audio(video_id, title, artist, tmp_path)
+		cover_bytes = yt_thumbnail_bytes(video_id)
+		tag_file(output_file, title, artist, cover_bytes)
+		send_audio(chat_id, output_file, title, artist, cover_bytes)
+
+	del PENDING_BY_CHAT[chat_id]
+
+
+def handle_callback_query(callback_query: Dict) -> None:
+	callback_query_id = callback_query.get("id")
+	from_user = callback_query.get("from") or {}
+	user_id = from_user.get("id")
+	if user_id != ALLOWED_USER_ID:
+		if callback_query_id:
+			answer_callback_query(callback_query_id, "Not allowed.", show_alert=True)
+		return
+
+	message = callback_query.get("message") or {}
+	chat = message.get("chat") or {}
+	chat_id = chat.get("id")
+	message_id = message.get("message_id")
+	data = (callback_query.get("data") or "").strip()
+
+	if not callback_query_id or not isinstance(chat_id, int):
+		return
+	if not data.startswith("pick:"):
+		answer_callback_query(callback_query_id, "Unknown action.", show_alert=False)
+		return
+
+	pending = PENDING_BY_CHAT.get(chat_id)
+	if not pending:
+		answer_callback_query(callback_query_id, "This result list expired. Search again.", show_alert=True)
+		return
+
+	try:
+		index = int(data.split(":", 1)[1])
+	except Exception:
+		answer_callback_query(callback_query_id, "Invalid choice.", show_alert=True)
+		return
+
+	if not (1 <= index <= len(pending.candidates)):
+		answer_callback_query(callback_query_id, "Choice out of range.", show_alert=True)
+		return
+
+	answer_callback_query(callback_query_id, f"Selected result {index}")
+	if isinstance(message_id, int):
+		try:
+			edit_message_reply_markup(chat_id, message_id, {"inline_keyboard": []})
+		except Exception:
+			pass
+	handle_choice(chat_id, str(index))
+
+
+def handle_direct_link(chat_id: int, url: str) -> None:
+	video_id = extract_youtube_video_id(url)
+	if not video_id:
+		send_message(chat_id, "Could not extract a YouTube video id from that link.")
+		return
+
+	title, artist = probe_video_metadata(url, video_id)
+	send_message(chat_id, f"Downloading from link: {artist} - {title}")
+	send_chat_action(chat_id, "upload_document")
+
+	with tempfile.TemporaryDirectory(prefix="tgmusic-") as tmpdir:
+		tmp_path = pathlib.Path(tmpdir)
+		output_file = download_audio(video_id, title, artist, tmp_path)
+		cover_bytes = yt_thumbnail_bytes(video_id)
+		tag_file(output_file, title, artist, cover_bytes)
+		send_audio(chat_id, output_file, title, artist, cover_bytes)
+
+
+def handle_social_video_link(chat_id: int, url: str) -> None:
+	send_message(chat_id, "Downloading video...")
+	send_chat_action(chat_id, "upload_video")
+
+	with tempfile.TemporaryDirectory(prefix="tgsocial-") as tmpdir:
+		tmp_path = pathlib.Path(tmpdir)
+		output_file = download_social_video(url, tmp_path)
+		try:
+			send_video(chat_id, output_file)
+		finally:
+			try:
+				output_file.unlink()
+			except Exception:
+				pass
+
+
+def extract_message(update: Dict) -> Optional[Dict]:
+	message = update.get("message")
+	if not isinstance(message, dict):
+		return None
+	return message
+
+
+def handle_message(message: Dict) -> None:
+	from_user = message.get("from") or {}
+	user_id = from_user.get("id")
+	if user_id != ALLOWED_USER_ID:
+		return
+
+	chat = message.get("chat") or {}
+	chat_id = chat.get("id")
+	if not isinstance(chat_id, int):
+		return
+
+	text = (message.get("text") or "").strip()
+	if not text:
+		return
+
+	if text == "/start":
+		send_message(chat_id, "Send a search query. Then tap one of the result buttons, or reply with the number.")
+		return
+
+	if text == "/help":
+		send_message(chat_id, "Usage:\n1. Send a song search query\n2. Tap one of the result buttons, or reply with 1-5\n3. Send a YouTube / YouTube Music link for audio\n4. Send a TikTok or Instagram Reels link for video\nOnly your user id is allowed.")
+		return
+
+	if re.fullmatch(r"\d+", text):
+		handle_choice(chat_id, text)
+		return
+
+	if is_youtube_url(text):
+		handle_direct_link(chat_id, text)
+		return
+
+	if is_social_video_url(text):
+		handle_social_video_link(chat_id, text)
+		return
+
+	handle_search(chat_id, text)
+
+
+def run_bot() -> int:
+	load_dotenv()
+	configure_proxy()
+	offset = None
+	print(f"Bot started. Allowed user id: {ALLOWED_USER_ID}")
+	while True:
+		try:
+			cleanup_old_pending()
+			updates = get_updates(offset)
+			for update in updates:
+				offset = update["update_id"] + 1
+				callback_query = update.get("callback_query")
+				if isinstance(callback_query, dict):
+					handle_callback_query(callback_query)
+					continue
+				message = extract_message(update)
+				if message is None:
+					continue
+				handle_message(message)
+		except KeyboardInterrupt:
+			print("Bot stopped.")
+			return 0
+		except Exception as exc:
+			print(f"Bot loop error: {exc}", file=sys.stderr)
+			time.sleep(3)
+
+
+if __name__ == "__main__":
+	sys.exit(run_bot())
