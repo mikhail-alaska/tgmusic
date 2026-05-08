@@ -27,6 +27,7 @@ YTM_URL = "https://music.youtube.com/watch?v={vid}"
 YT_URL = "https://www.youtube.com/watch?v={vid}"
 YOUTUBE_CLIENTS = ["ios", "tv_embedded", "webremix"]
 POLL_TIMEOUT_S = 30
+STARTED_AT = time.time()
 
 PENALTY_TERMS = {
 	"live",
@@ -193,6 +194,57 @@ def send_video(chat_id: int, path: pathlib.Path, caption: Optional[str] = None) 
 		files["video"][1].close()
 
 
+def send_photo(chat_id: int, path: pathlib.Path, caption: Optional[str] = None) -> None:
+	data = {"chat_id": str(chat_id)}
+	if caption:
+		data["caption"] = caption[:1024]
+	files = {"photo": (path.name, path.open("rb"), "image/jpeg")}
+	try:
+		api_call("sendPhoto", data=data, files=files, timeout=300)
+	finally:
+		files["photo"][1].close()
+
+
+def send_document(chat_id: int, path: pathlib.Path, caption: Optional[str] = None) -> None:
+	data = {"chat_id": str(chat_id)}
+	if caption:
+		data["caption"] = caption[:1024]
+	files = {"document": (path.name, path.open("rb"), "application/octet-stream")}
+	try:
+		api_call("sendDocument", data=data, files=files, timeout=300)
+	finally:
+		files["document"][1].close()
+
+
+def send_media_group(chat_id: int, paths: List[pathlib.Path], caption: Optional[str] = None) -> None:
+	data = {"chat_id": str(chat_id)}
+	files = {}
+	handles = []
+	media = []
+	try:
+		for index, path in enumerate(paths):
+			kind = social_media_kind(path)
+			attach_name = f"media{index}"
+			handle = path.open("rb")
+			handles.append(handle)
+			mime = "video/mp4" if kind == "video" else "image/jpeg"
+			files[attach_name] = (path.name, handle, mime)
+			item = {
+				"type": "video" if kind == "video" else "photo",
+				"media": f"attach://{attach_name}",
+			}
+			if kind == "video":
+				item["supports_streaming"] = True
+			if caption and index == 0:
+				item["caption"] = caption[:1024]
+			media.append(item)
+		data["media"] = json.dumps(media)
+		api_call("sendMediaGroup", data=data, files=files, timeout=300)
+	finally:
+		for handle in handles:
+			handle.close()
+
+
 def toks(text: str) -> Set[str]:
 	return set(re.findall(r"[^\W_]+", (text or "").lower(), flags=re.UNICODE))
 
@@ -339,7 +391,9 @@ def find_best(search_query: str) -> Tuple[Optional[Dict], float, List[Dict]]:
 
 
 def sanitize_name(name: str) -> str:
-	return re.sub(r'[\\/:*?"<>|]+', "_", name or "").strip()
+	cleaned = re.sub(r'[\\/:*?"<>|]+', "_", name or "")
+	cleaned = re.sub(r"\s+", " ", cleaned).strip().strip(".")
+	return cleaned[:120] or "file"
 
 
 def is_youtube_url(text: str) -> bool:
@@ -476,6 +530,119 @@ def ytdlp_path() -> str:
 	return "yt-dlp"
 
 
+def format_uptime(seconds: float) -> str:
+	total = max(0, int(seconds))
+	hours, rem = divmod(total, 3600)
+	minutes, secs = divmod(rem, 60)
+	if hours:
+		return f"{hours}h {minutes}m {secs}s"
+	if minutes:
+		return f"{minutes}m {secs}s"
+	return f"{secs}s"
+
+
+def probe_ytdlp_status() -> str:
+	try:
+		proc = subprocess.run(
+			[ytdlp_path(), "--version"],
+			capture_output=True,
+			text=True,
+			timeout=10,
+		)
+	except Exception as exc:
+		return f"error: {exc}"
+	if proc.returncode != 0:
+		detail = (proc.stderr or proc.stdout or "").strip()
+		return f"error: {detail or f'exit {proc.returncode}'}"
+	return (proc.stdout or "").strip() or "ok"
+
+
+def probe_proxy_status() -> str:
+	try:
+		resp = HTTP.get("https://www.youtube.com/generate_204", timeout=10)
+		return f"ok ({resp.status_code})"
+	except Exception as exc:
+		return f"error: {exc}"
+
+
+def build_status_text() -> str:
+	lines = [
+		"Status:",
+		f"uptime: {format_uptime(time.time() - STARTED_AT)}",
+		f"pending choices: {len(PENDING_BY_CHAT)}",
+		f"proxy: {probe_proxy_status()}",
+		f"yt-dlp: {probe_ytdlp_status()}",
+	]
+	return "\n".join(lines)
+
+
+def social_media_fallback_name(url: str) -> str:
+	try:
+		parsed = urlparse(url.strip())
+	except Exception:
+		return "social_media"
+	host = (parsed.netloc or "").lower().replace("www.", "")
+	parts = [part for part in (parsed.path or "").split("/") if part]
+	host_name = host.split(".")[0] or "social"
+	if len(parts) >= 2:
+		return sanitize_name(f"{host_name}_{parts[0]}_{parts[1]}")
+	if parts:
+		return sanitize_name(f"{host_name}_{parts[0]}")
+	return sanitize_name(f"{host_name}_media")
+
+
+def social_media_base_name(url: str) -> str:
+	yt_bin = ytdlp_path()
+	cmd = [
+		yt_bin,
+		"--dump-single-json",
+		"--proxy",
+		PROXY_URL,
+		"--no-playlist",
+		"--socket-timeout",
+		"30",
+		url,
+	]
+	try:
+		proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+		if proc.returncode != 0:
+			return social_media_fallback_name(url)
+		payload = json.loads(proc.stdout)
+	except Exception:
+		return social_media_fallback_name(url)
+
+	title = str(payload.get("title") or "").strip()
+	uploader = str(payload.get("uploader") or payload.get("channel") or "").strip()
+	if title and uploader:
+		base_name = f"{uploader} - {title}"
+	elif title:
+		base_name = title
+	elif uploader:
+		base_name = uploader
+	else:
+		base_name = social_media_fallback_name(url)
+	return sanitize_name(base_name)
+
+
+def rename_social_media_files(files: List[pathlib.Path], base_name: str) -> List[pathlib.Path]:
+	if not files:
+		return files
+	renamed = []
+	multiple = len(files) > 1
+	for index, path in enumerate(sorted(files), start=1):
+		suffix = path.suffix.lower()
+		stem = f"{base_name}_{index:02d}" if multiple else base_name
+		target = path.with_name(f"{stem}{suffix}")
+		counter = 2
+		while target.exists() and target != path:
+			target = path.with_name(f"{stem}_{counter:02d}{suffix}")
+			counter += 1
+		if target != path:
+			path = path.rename(target)
+		renamed.append(path)
+	return renamed
+
+
 def download_audio(video_id: str, title: str, artist: str, out_dir: pathlib.Path) -> pathlib.Path:
 	out_dir.mkdir(parents=True, exist_ok=True)
 	base_name = sanitize_name(f"{artist} - {title}")
@@ -516,14 +683,12 @@ def download_audio(video_id: str, title: str, artist: str, out_dir: pathlib.Path
 	raise RuntimeError(f"Download failed: {last_error}")
 
 
-def download_social_video(url: str, out_dir: pathlib.Path) -> pathlib.Path:
+def download_social_media(url: str, out_dir: pathlib.Path) -> List[pathlib.Path]:
 	out_dir.mkdir(parents=True, exist_ok=True)
-	out_template = str(out_dir / "social_video.%(ext)s")
+	out_template = str(out_dir / "social_%(autonumber)03d.%(ext)s")
 	yt_bin = ytdlp_path()
 	cmd = [
 		yt_bin,
-		"-f",
-		"bv*+ba/b",
 		"--merge-output-format",
 		"mp4",
 		"--proxy",
@@ -545,13 +710,40 @@ def download_social_video(url: str, out_dir: pathlib.Path) -> pathlib.Path:
 		detail = (proc.stderr or proc.stdout or "").strip()[-700:]
 		raise RuntimeError(f"yt-dlp failed: {detail}")
 	files = sorted(
-		[path for path in out_dir.iterdir() if path.is_file() and path.name.startswith("social_video.")],
-		key=lambda path: path.stat().st_mtime,
-		reverse=True,
+		[
+			path for path in out_dir.iterdir()
+			if path.is_file()
+			and path.name.startswith("social_")
+			and path.suffix.lower() not in {".part", ".ytdl", ".json", ".description", ".vtt", ".srt", ".ass"}
+		]
 	)
 	if not files:
-		raise RuntimeError("yt-dlp reported success but no video file was created.")
-	return files[0]
+		raise RuntimeError("yt-dlp reported success but no media file was created.")
+	return rename_social_media_files(files, social_media_base_name(url))
+
+
+def social_media_kind(path: pathlib.Path) -> str:
+	suffix = path.suffix.lower()
+	if suffix in {".jpg", ".jpeg", ".png"}:
+		return "photo"
+	if suffix in {".mp4", ".mov", ".m4v", ".webm"}:
+		return "video"
+	return "document"
+
+
+def send_social_media(chat_id: int, path: pathlib.Path, caption: Optional[str] = None) -> None:
+	kind = social_media_kind(path)
+	if kind == "photo":
+		send_photo(chat_id, path, caption)
+		return
+	if kind == "video":
+		send_video(chat_id, path, caption)
+		return
+	send_document(chat_id, path, caption)
+
+
+def can_send_as_media_group(paths: List[pathlib.Path]) -> bool:
+	return len(paths) > 1 and all(social_media_kind(path) in {"photo", "video"} for path in paths)
 
 
 def format_candidates(candidates: List[Dict], limit: int = 5) -> str:
@@ -697,19 +889,25 @@ def handle_direct_link(chat_id: int, url: str) -> None:
 
 
 def handle_social_video_link(chat_id: int, url: str) -> None:
-	send_message(chat_id, "Downloading video...")
-	send_chat_action(chat_id, "upload_video")
+	send_message(chat_id, "Downloading media...")
+	send_chat_action(chat_id, "upload_document")
 
 	with tempfile.TemporaryDirectory(prefix="tgsocial-") as tmpdir:
 		tmp_path = pathlib.Path(tmpdir)
-		output_file = download_social_video(url, tmp_path)
+		output_files = download_social_media(url, tmp_path)
 		try:
-			send_video(chat_id, output_file)
+			if can_send_as_media_group(output_files):
+				send_media_group(chat_id, output_files, caption=url)
+			else:
+				for index, output_file in enumerate(output_files):
+					caption = url if index == 0 and len(output_files) > 1 else None
+					send_social_media(chat_id, output_file, caption)
 		finally:
-			try:
-				output_file.unlink()
-			except Exception:
-				pass
+			for output_file in output_files:
+				try:
+					output_file.unlink()
+				except Exception:
+					pass
 
 
 def extract_message(update: Dict) -> Optional[Dict]:
@@ -739,7 +937,12 @@ def handle_message(message: Dict) -> None:
 		return
 
 	if text == "/help":
-		send_message(chat_id, "Usage:\n1. Send a song search query\n2. Tap one of the result buttons, or reply with 1-5\n3. Send a YouTube / YouTube Music link for audio\n4. Send a TikTok or Instagram Reels link for video\nOnly your user id is allowed.")
+		send_message(chat_id, "Usage:\n1. Send a song search query\n2. Tap one of the result buttons, or reply with 1-5\n3. Send a YouTube / YouTube Music link for audio\n4. Send a TikTok or Instagram link for media\n5. Send /status to check bot health\nOnly your user id is allowed.")
+		return
+
+	if text == "/status":
+		send_chat_action(chat_id, "typing")
+		send_message(chat_id, build_status_text())
 		return
 
 	if re.fullmatch(r"\d+", text):
