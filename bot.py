@@ -451,31 +451,6 @@ def infer_cycle_position(days: List[ScheduleDay]) -> int:
 	return best_index
 
 
-def manual_event_dates(item: Dict) -> Set[date]:
-	zone = calendar_zoneinfo()
-	start = item.get("start") or {}
-	end = item.get("end") or {}
-	if start.get("date"):
-		start_day = date.fromisoformat(start["date"])
-		end_day = date.fromisoformat(end.get("date", start["date"]))
-		last_day = end_day - timedelta(days=1)
-	else:
-		start_value = start.get("dateTime")
-		end_value = end.get("dateTime")
-		if not start_value or not end_value:
-			return set()
-		start_dt = datetime.fromisoformat(start_value.replace("Z", "+00:00")).astimezone(zone)
-		end_dt = datetime.fromisoformat(end_value.replace("Z", "+00:00")).astimezone(zone)
-		start_day = start_dt.date()
-		last_day = (end_dt - timedelta(seconds=1)).date()
-	days: Set[date] = set()
-	current_day = start_day
-	while current_day <= last_day:
-		days.add(current_day)
-		current_day += timedelta(days=1)
-	return days
-
-
 def extend_schedule_with_forecast(days: List[ScheduleDay]) -> List[ScheduleDay]:
 	if not days:
 		return []
@@ -567,7 +542,6 @@ def sync_schedule_to_google_calendar(
 	shifts: List[ScheduleShift],
 	source_info: Optional[str],
 	schedule_dates: List[date],
-	manual_skip_dates: Optional[Set[date]] = None,
 ) -> Dict[str, int]:
 	if schedule_dates:
 		range_start = datetime.combine(min(schedule_dates), dt_time.min) - timedelta(days=1)
@@ -577,7 +551,6 @@ def sync_schedule_to_google_calendar(
 		range_end = max(shift.end_at for shift in shifts) + timedelta(days=1)
 	else:
 		return {"created": 0, "updated": 0, "deleted": 0}
-	manual_skip_dates = manual_skip_dates or set()
 	all_events = list_calendar_events(range_start, range_end)
 	existing_events = []
 	for item in all_events:
@@ -599,8 +572,6 @@ def sync_schedule_to_google_calendar(
 	deleted = 0
 
 	for schedule_key, shift in desired_by_key.items():
-		if shift.shift_date in manual_skip_dates:
-			continue
 		payload = schedule_event_payload(shift, source_info)
 		current_items = existing_by_key.get(schedule_key, [])
 		if not current_items:
@@ -620,6 +591,7 @@ def sync_schedule_to_google_calendar(
 				((primary.get("start") or {}).get("dateTime") or "") != payload["start"]["dateTime"],
 				((primary.get("end") or {}).get("dateTime") or "") != payload["end"]["dateTime"],
 				((primary.get("description") or "") != payload["description"]),
+				str(primary.get("colorId") or "") != str(payload.get("colorId") or ""),
 				private_props.get("source_info", "") != (source_info or ""),
 			)
 		)
@@ -649,24 +621,9 @@ def handle_schedule_message(chat_id: int, text: str) -> None:
 	extended_days = extend_schedule_with_forecast(days)
 	forecast_days = extended_days[len(days):]
 	forecast_shifts = build_forecast_shifts(forecast_days)
-	forecast_skip_dates: Set[date] = set()
-	if forecast_days:
-		forecast_start = datetime.combine(forecast_days[0].shift_date, dt_time.min)
-		forecast_end = datetime.combine(forecast_days[-1].shift_date, dt_time.max) + timedelta(days=1)
-		for item in list_calendar_events(forecast_start, forecast_end):
-			private_props = (((item.get("extendedProperties") or {}).get("private")) or {})
-			if private_props.get("source") == GCAL_SYNC_SOURCE:
-				continue
-			forecast_skip_dates.update(manual_event_dates(item))
-	forecast_skipped_count = sum(1 for shift in forecast_shifts if shift.shift_date in forecast_skip_dates)
-	all_shifts = shifts + [shift for shift in forecast_shifts if shift.shift_date not in forecast_skip_dates]
+	all_shifts = shifts + forecast_shifts
 	all_dates = schedule_dates + [day.shift_date for day in forecast_days]
-	stats = sync_schedule_to_google_calendar(
-		all_shifts,
-		source_info,
-		all_dates,
-		manual_skip_dates=forecast_skip_dates,
-	)
+	stats = sync_schedule_to_google_calendar(all_shifts, source_info, all_dates)
 	first_day = min(schedule_dates) if schedule_dates else None
 	last_day = max(all_dates) if all_dates else None
 	period = f"{first_day.isoformat()} .. {last_day.isoformat()}" if first_day and last_day else "n/a"
@@ -675,8 +632,7 @@ def handle_schedule_message(chat_id: int, text: str) -> None:
 		"Расписание синхронизировано с Google Calendar.\n"
 		f"Период: {period}\n"
 		f"Смен из сообщения: {len(shifts)}\n"
-		f"Автодобавлено вперёд: {len(forecast_shifts) - forecast_skipped_count}\n"
-		f"Пропущено из-за ручных исключений: {forecast_skipped_count}\n"
+		f"Автодобавлено вперёд: {len(forecast_shifts)}\n"
 		f"Выходных пропущено: {off_days}\n"
 		f"Создано: {stats['created']}\n"
 		f"Обновлено: {stats['updated']}\n"
