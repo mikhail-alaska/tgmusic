@@ -9,8 +9,11 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import date, datetime, time as dt_time, timedelta
+from hashlib import sha1
 from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 from mutagen.easyid3 import EasyID3
@@ -28,6 +31,15 @@ YT_URL = "https://www.youtube.com/watch?v={vid}"
 YOUTUBE_CLIENTS = ["ios", "tv_embedded", "webremix"]
 POLL_TIMEOUT_S = 30
 STARTED_AT = time.time()
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3"
+GCAL_SYNC_SOURCE = "tgmusic_schedule_sync"
+SCHEDULE_DATE_RE = re.compile(r"^📅\s*(\d{4}-\d{2}-\d{2})\s*$")
+SCHEDULE_ENTRY_RE = re.compile(
+	r"^\*\s*(?:\[(?P<name>[^\]]+)\]\([^)]+\)|(?P<plain_name>.+?))\s*—\s*(?P<shift>.+?)\s*$"
+)
+SCHEDULE_TIME_RE = re.compile(r"^(?P<start>\d{2}:\d{2})\s*-\s*(?P<end>\d{2}:\d{2})$")
+SD_INFO_RE = re.compile(r"Информация из SD:\s*(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2})")
 
 PENALTY_TERMS = {
 	"live",
@@ -54,6 +66,19 @@ class PendingChoice:
 	query: str
 	candidates: List[Dict]
 	created_at: float
+
+
+@dataclass
+class ScheduleShift:
+	employee: str
+	shift_date: date
+	start_at: datetime
+	end_at: datetime
+	raw_shift: str
+
+	@property
+	def schedule_key(self) -> str:
+		return f"{self.shift_date.isoformat()}|{self.employee}|{self.raw_shift}"
 
 
 PENDING_BY_CHAT: Dict[int, PendingChoice] = {}
@@ -243,6 +268,283 @@ def send_media_group(chat_id: int, paths: List[pathlib.Path], caption: Optional[
 	finally:
 		for handle in handles:
 			handle.close()
+
+
+def google_calendar_id() -> str:
+	return os.environ.get("GOOGLE_CALENDAR_ID", "primary").strip() or "primary"
+
+
+def google_calendar_timezone() -> str:
+	return os.environ.get("GOOGLE_CALENDAR_TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow"
+
+
+def calendar_zoneinfo() -> ZoneInfo:
+	return ZoneInfo(google_calendar_timezone())
+
+
+def google_access_token() -> str:
+	client_id = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+	client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
+	refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN", "").strip()
+	missing = [
+		name
+		for name, value in (
+			("GOOGLE_CLIENT_ID", client_id),
+			("GOOGLE_CLIENT_SECRET", client_secret),
+			("GOOGLE_REFRESH_TOKEN", refresh_token),
+		)
+		if not value
+	]
+	if missing:
+		raise RuntimeError("Missing Google Calendar settings: " + ", ".join(missing))
+	resp = HTTP.post(
+		GOOGLE_TOKEN_URL,
+		data={
+			"client_id": client_id,
+			"client_secret": client_secret,
+			"refresh_token": refresh_token,
+			"grant_type": "refresh_token",
+		},
+		timeout=30,
+	)
+	resp.raise_for_status()
+	payload = resp.json()
+	access_token = str(payload.get("access_token") or "").strip()
+	if not access_token:
+		raise RuntimeError(f"Google token response has no access_token: {payload}")
+	return access_token
+
+
+def google_calendar_request(
+	method: str,
+	path: str,
+	*,
+	params: Optional[Dict] = None,
+	json_body: Optional[Dict] = None,
+) -> Dict:
+	resp = HTTP.request(
+		method,
+		f"{GOOGLE_CALENDAR_API_BASE}/{path.lstrip('/')}",
+		params=params,
+		json=json_body,
+		headers={
+			"Authorization": f"Bearer {google_access_token()}",
+			"Accept": "application/json",
+		},
+		timeout=60,
+	)
+	resp.raise_for_status()
+	if resp.status_code == 204 or not resp.content:
+		return {}
+	return resp.json()
+
+
+def is_schedule_message(text: str) -> bool:
+	return "🗓" in text and "Расписание" in text and "📅" in text
+
+
+def parse_schedule_message(text: str) -> Tuple[List[ScheduleShift], int, Optional[str], List[date]]:
+	shifts: List[ScheduleShift] = []
+	current_date: Optional[date] = None
+	off_days = 0
+	seen_dates: List[date] = []
+	info_match = SD_INFO_RE.search(text)
+	source_info = info_match.group(1) if info_match else None
+
+	for raw_line in text.splitlines():
+		line = raw_line.strip()
+		if not line:
+			continue
+		date_match = SCHEDULE_DATE_RE.match(line)
+		if date_match:
+			current_date = date.fromisoformat(date_match.group(1))
+			seen_dates.append(current_date)
+			continue
+		entry_match = SCHEDULE_ENTRY_RE.match(line)
+		if not entry_match:
+			continue
+		if current_date is None:
+			raise ValueError("Found a shift row before any date row.")
+		employee = (entry_match.group("name") or entry_match.group("plain_name") or "").strip()
+		shift_text = entry_match.group("shift").strip()
+		if not employee:
+			raise ValueError(f"Could not parse employee name in line: {line}")
+		if shift_text.casefold() == "выходной":
+			off_days += 1
+			continue
+		time_match = SCHEDULE_TIME_RE.match(shift_text)
+		if not time_match:
+			raise ValueError(f"Unsupported shift format: {shift_text}")
+		start_clock = dt_time.fromisoformat(time_match.group("start"))
+		end_clock = dt_time.fromisoformat(time_match.group("end"))
+		start_at = datetime.combine(current_date, start_clock)
+		end_at = datetime.combine(current_date, end_clock)
+		if end_at <= start_at:
+			end_at += timedelta(days=1)
+		shifts.append(
+			ScheduleShift(
+				employee=employee,
+				shift_date=current_date,
+				start_at=start_at,
+				end_at=end_at,
+				raw_shift=shift_text,
+			)
+		)
+
+	if not shifts and off_days == 0:
+		raise ValueError("No schedule rows were found in the message.")
+	return shifts, off_days, source_info, seen_dates
+
+
+def schedule_event_id(schedule_key: str) -> str:
+	return f"tgshift{sha1(schedule_key.encode('utf-8')).hexdigest()[:28]}"
+
+
+def schedule_event_payload(shift: ScheduleShift, source_info: Optional[str]) -> Dict:
+	timezone = google_calendar_timezone()
+	start_at = shift.start_at.replace(tzinfo=calendar_zoneinfo())
+	end_at = shift.end_at.replace(tzinfo=calendar_zoneinfo())
+	description_lines = [
+		f"Employee: {shift.employee}",
+		f"Shift date: {shift.shift_date.isoformat()}",
+		f"Shift hours: {shift.raw_shift}",
+		"Imported from Telegram schedule message.",
+	]
+	if source_info:
+		description_lines.append(f"SD info: {source_info}")
+	return {
+		"id": schedule_event_id(shift.schedule_key),
+		"summary": f"Смена: {shift.employee}",
+		"description": "\n".join(description_lines),
+		"start": {"dateTime": start_at.isoformat(), "timeZone": timezone},
+		"end": {"dateTime": end_at.isoformat(), "timeZone": timezone},
+		"extendedProperties": {
+			"private": {
+				"source": GCAL_SYNC_SOURCE,
+				"schedule_key": shift.schedule_key,
+				"employee": shift.employee,
+				"raw_shift": shift.raw_shift,
+				"source_info": source_info or "",
+			}
+		},
+	}
+
+
+def list_synced_calendar_events(date_from: datetime, date_to: datetime) -> List[Dict]:
+	calendar_id = quote(google_calendar_id(), safe="")
+	zone = calendar_zoneinfo()
+	start_value = date_from.replace(tzinfo=zone).isoformat()
+	end_value = date_to.replace(tzinfo=zone).isoformat()
+	page_token: Optional[str] = None
+	items: List[Dict] = []
+	while True:
+		params = {
+			"timeMin": start_value,
+			"timeMax": end_value,
+			"singleEvents": "true",
+			"showDeleted": "false",
+			"maxResults": "2500",
+		}
+		if page_token:
+			params["pageToken"] = page_token
+		payload = google_calendar_request("GET", f"calendars/{calendar_id}/events", params=params)
+		for item in payload.get("items", []):
+			private_props = (((item.get("extendedProperties") or {}).get("private")) or {})
+			if private_props.get("source") == GCAL_SYNC_SOURCE:
+				items.append(item)
+		page_token = payload.get("nextPageToken")
+		if not page_token:
+			return items
+
+
+def sync_schedule_to_google_calendar(
+	shifts: List[ScheduleShift],
+	source_info: Optional[str],
+	schedule_dates: List[date],
+) -> Dict[str, int]:
+	if schedule_dates:
+		range_start = datetime.combine(min(schedule_dates), dt_time.min) - timedelta(days=1)
+		range_end = datetime.combine(max(schedule_dates), dt_time.max) + timedelta(days=1)
+	elif shifts:
+		range_start = min(shift.start_at for shift in shifts) - timedelta(days=1)
+		range_end = max(shift.end_at for shift in shifts) + timedelta(days=1)
+	else:
+		return {"created": 0, "updated": 0, "deleted": 0}
+	existing_events = list_synced_calendar_events(range_start, range_end)
+	desired_by_key = {shift.schedule_key: shift for shift in shifts}
+	existing_by_key: Dict[str, List[Dict]] = {}
+	for item in existing_events:
+		private_props = (((item.get("extendedProperties") or {}).get("private")) or {})
+		schedule_key = str(private_props.get("schedule_key") or "").strip()
+		if not schedule_key:
+			continue
+		existing_by_key.setdefault(schedule_key, []).append(item)
+
+	calendar_id = quote(google_calendar_id(), safe="")
+	created = 0
+	updated = 0
+	deleted = 0
+
+	for schedule_key, shift in desired_by_key.items():
+		payload = schedule_event_payload(shift, source_info)
+		current_items = existing_by_key.get(schedule_key, [])
+		if not current_items:
+			google_calendar_request("POST", f"calendars/{calendar_id}/events", json_body=payload)
+			created += 1
+			continue
+		primary = current_items[0]
+		for duplicate in current_items[1:]:
+			duplicate_id = duplicate.get("id")
+			if duplicate_id:
+				google_calendar_request("DELETE", f"calendars/{calendar_id}/events/{quote(str(duplicate_id), safe='')}")
+				deleted += 1
+		private_props = (((primary.get("extendedProperties") or {}).get("private")) or {})
+		needs_update = any(
+			(
+				(primary.get("summary") or "") != payload["summary"],
+				((primary.get("start") or {}).get("dateTime") or "") != payload["start"]["dateTime"],
+				((primary.get("end") or {}).get("dateTime") or "") != payload["end"]["dateTime"],
+				((primary.get("description") or "") != payload["description"]),
+				private_props.get("source_info", "") != (source_info or ""),
+			)
+		)
+		if needs_update:
+			google_calendar_request(
+				"PUT",
+				f"calendars/{calendar_id}/events/{quote(str(primary['id']), safe='')}",
+				json_body=payload,
+			)
+			updated += 1
+
+	for schedule_key, current_items in existing_by_key.items():
+		if schedule_key in desired_by_key:
+			continue
+		for item in current_items:
+			event_id = item.get("id")
+			if event_id:
+				google_calendar_request("DELETE", f"calendars/{calendar_id}/events/{quote(str(event_id), safe='')}")
+				deleted += 1
+
+	return {"created": created, "updated": updated, "deleted": deleted}
+
+
+def handle_schedule_message(chat_id: int, text: str) -> None:
+	send_chat_action(chat_id, "typing")
+	shifts, off_days, source_info, schedule_dates = parse_schedule_message(text)
+	stats = sync_schedule_to_google_calendar(shifts, source_info, schedule_dates)
+	first_day = min(schedule_dates) if schedule_dates else None
+	last_day = max(schedule_dates) if schedule_dates else None
+	period = f"{first_day.isoformat()} .. {last_day.isoformat()}" if first_day and last_day else "n/a"
+	send_message(
+		chat_id,
+		"Расписание синхронизировано с Google Calendar.\n"
+		f"Период: {period}\n"
+		f"Смен: {len(shifts)}\n"
+		f"Выходных пропущено: {off_days}\n"
+		f"Создано: {stats['created']}\n"
+		f"Обновлено: {stats['updated']}\n"
+		f"Удалено старых: {stats['deleted']}",
+	)
 
 
 def toks(text: str) -> Set[str]:
@@ -565,6 +867,18 @@ def probe_proxy_status() -> str:
 		return f"error: {exc}"
 
 
+def probe_google_calendar_status() -> str:
+	required = (
+		"GOOGLE_CLIENT_ID",
+		"GOOGLE_CLIENT_SECRET",
+		"GOOGLE_REFRESH_TOKEN",
+	)
+	missing = [name for name in required if not os.environ.get(name, "").strip()]
+	if missing:
+		return "missing " + ", ".join(missing)
+	return f"configured (calendar={google_calendar_id()}, tz={google_calendar_timezone()})"
+
+
 def build_status_text() -> str:
 	lines = [
 		"Status:",
@@ -572,6 +886,7 @@ def build_status_text() -> str:
 		f"pending choices: {len(PENDING_BY_CHAT)}",
 		f"proxy: {probe_proxy_status()}",
 		f"yt-dlp: {probe_ytdlp_status()}",
+		f"google calendar: {probe_google_calendar_status()}",
 	]
 	return "\n".join(lines)
 
@@ -933,16 +1248,42 @@ def handle_message(message: Dict) -> None:
 		return
 
 	if text == "/start":
-		send_message(chat_id, "Send a search query. Then tap one of the result buttons, or reply with the number.")
+		send_message(
+			chat_id,
+			"Send a song search query or a supported media link.\n"
+			"You can also send a schedule message starting with `🗓 Расписание`, and the bot will sync shifts to Google Calendar.",
+		)
 		return
 
 	if text == "/help":
-		send_message(chat_id, "Usage:\n1. Send a song search query\n2. Tap one of the result buttons, or reply with 1-5\n3. Send a YouTube / YouTube Music link for audio\n4. Send a TikTok or Instagram link for media\n5. Send /status to check bot health\nOnly your user id is allowed.")
+		send_message(
+			chat_id,
+			"Usage:\n"
+			"1. Send a song search query\n"
+			"2. Tap one of the result buttons, or reply with 1-5\n"
+			"3. Send a YouTube / YouTube Music link for audio\n"
+			"4. Send a TikTok or Instagram link for media\n"
+			"5. Send a schedule message starting with `🗓 Расписание` to sync shifts to Google Calendar\n"
+			"6. Send /status to check bot health\n"
+			"Only your user id is allowed.",
+		)
 		return
 
 	if text == "/status":
 		send_chat_action(chat_id, "typing")
 		send_message(chat_id, build_status_text())
+		return
+
+	if is_schedule_message(text):
+		try:
+			handle_schedule_message(chat_id, text)
+		except Exception as exc:
+			send_message(
+				chat_id,
+				"Не удалось синхронизировать расписание в Google Calendar.\n"
+				f"Ошибка: {exc}\n\n"
+				"Проверь формат сообщения и переменные GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN.",
+			)
 		return
 
 	if re.fullmatch(r"\d+", text):
