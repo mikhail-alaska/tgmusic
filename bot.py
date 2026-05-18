@@ -34,6 +34,19 @@ STARTED_AT = time.time()
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3"
 GCAL_SYNC_SOURCE = "tgmusic_schedule_sync"
+FORECAST_DAYS = 30
+SHIFT_COLOR_IDS = {
+	"16:00 - 20:00": "9",
+	"06:00 - 16:00": "10",
+	"20:00 - 06:00": "6",
+}
+SHIFT_CYCLE = [
+	"16:00 - 20:00",
+	"06:00 - 16:00",
+	"20:00 - 06:00",
+	"Выходной",
+	"Выходной",
+]
 SCHEDULE_DATE_RE = re.compile(r"^📅\s*(\d{4}-\d{2}-\d{2})\s*$")
 SCHEDULE_ENTRY_RE = re.compile(
 	r"^\*\s*(?:\[(?P<name>[^\]]+)\]\([^)]+\)|(?P<plain_name>.+?))\s*—\s*(?P<shift>.+?)\s*$"
@@ -79,6 +92,13 @@ class ScheduleShift:
 	@property
 	def schedule_key(self) -> str:
 		return f"{self.shift_date.isoformat()}|{self.employee}|{self.raw_shift}"
+
+
+@dataclass
+class ScheduleDay:
+	employee: str
+	shift_date: date
+	raw_shift: str
 
 
 PENDING_BY_CHAT: Dict[int, PendingChoice] = {}
@@ -343,8 +363,28 @@ def is_schedule_message(text: str) -> bool:
 	return "🗓" in text and "Расписание" in text and "📅" in text
 
 
-def parse_schedule_message(text: str) -> Tuple[List[ScheduleShift], int, Optional[str], List[date]]:
+def build_shift(employee: str, shift_date: date, shift_text: str) -> ScheduleShift:
+	time_match = SCHEDULE_TIME_RE.match(shift_text)
+	if not time_match:
+		raise ValueError(f"Unsupported shift format: {shift_text}")
+	start_clock = dt_time.fromisoformat(time_match.group("start"))
+	end_clock = dt_time.fromisoformat(time_match.group("end"))
+	start_at = datetime.combine(shift_date, start_clock)
+	end_at = datetime.combine(shift_date, end_clock)
+	if end_at <= start_at:
+		end_at += timedelta(days=1)
+	return ScheduleShift(
+		employee=employee,
+		shift_date=shift_date,
+		start_at=start_at,
+		end_at=end_at,
+		raw_shift=shift_text,
+	)
+
+
+def parse_schedule_message(text: str) -> Tuple[List[ScheduleShift], int, Optional[str], List[date], List[ScheduleDay]]:
 	shifts: List[ScheduleShift] = []
+	days: List[ScheduleDay] = []
 	current_date: Optional[date] = None
 	off_days = 0
 	seen_dates: List[date] = []
@@ -369,41 +409,107 @@ def parse_schedule_message(text: str) -> Tuple[List[ScheduleShift], int, Optiona
 		shift_text = entry_match.group("shift").strip()
 		if not employee:
 			raise ValueError(f"Could not parse employee name in line: {line}")
+		days.append(ScheduleDay(employee=employee, shift_date=current_date, raw_shift=shift_text))
 		if shift_text.casefold() == "выходной":
 			off_days += 1
 			continue
-		time_match = SCHEDULE_TIME_RE.match(shift_text)
-		if not time_match:
-			raise ValueError(f"Unsupported shift format: {shift_text}")
-		start_clock = dt_time.fromisoformat(time_match.group("start"))
-		end_clock = dt_time.fromisoformat(time_match.group("end"))
-		start_at = datetime.combine(current_date, start_clock)
-		end_at = datetime.combine(current_date, end_clock)
-		if end_at <= start_at:
-			end_at += timedelta(days=1)
-		shifts.append(
-			ScheduleShift(
-				employee=employee,
-				shift_date=current_date,
-				start_at=start_at,
-				end_at=end_at,
-				raw_shift=shift_text,
-			)
-		)
+		shifts.append(build_shift(employee, current_date, shift_text))
 
 	if not shifts and off_days == 0:
 		raise ValueError("No schedule rows were found in the message.")
-	return shifts, off_days, source_info, seen_dates
+	return shifts, off_days, source_info, seen_dates, days
 
 
 def schedule_event_id(schedule_key: str) -> str:
 	return f"tgshift{sha1(schedule_key.encode('utf-8')).hexdigest()[:28]}"
 
 
+def schedule_shift_color_id(raw_shift: str) -> Optional[str]:
+	return SHIFT_COLOR_IDS.get(raw_shift)
+
+
+def infer_cycle_position(days: List[ScheduleDay]) -> int:
+	if not days:
+		raise ValueError("Cannot infer shift cycle from an empty schedule.")
+	ordered_days = sorted(days, key=lambda item: item.shift_date)
+	statuses = [item.raw_shift for item in ordered_days]
+	best_index = 0
+	best_score = -1
+	for candidate_index, cycle_value in enumerate(SHIFT_CYCLE):
+		if cycle_value != statuses[-1]:
+			continue
+		score = 0
+		for offset, status in enumerate(reversed(statuses)):
+			if SHIFT_CYCLE[(candidate_index - offset) % len(SHIFT_CYCLE)] != status:
+				break
+			score += 1
+		if score > best_score:
+			best_score = score
+			best_index = candidate_index
+	if best_score <= 0:
+		raise ValueError("Could not align the provided schedule with the expected work cycle.")
+	return best_index
+
+
+def manual_event_dates(item: Dict) -> Set[date]:
+	zone = calendar_zoneinfo()
+	start = item.get("start") or {}
+	end = item.get("end") or {}
+	if start.get("date"):
+		start_day = date.fromisoformat(start["date"])
+		end_day = date.fromisoformat(end.get("date", start["date"]))
+		last_day = end_day - timedelta(days=1)
+	else:
+		start_value = start.get("dateTime")
+		end_value = end.get("dateTime")
+		if not start_value or not end_value:
+			return set()
+		start_dt = datetime.fromisoformat(start_value.replace("Z", "+00:00")).astimezone(zone)
+		end_dt = datetime.fromisoformat(end_value.replace("Z", "+00:00")).astimezone(zone)
+		start_day = start_dt.date()
+		last_day = (end_dt - timedelta(seconds=1)).date()
+	days: Set[date] = set()
+	current_day = start_day
+	while current_day <= last_day:
+		days.add(current_day)
+		current_day += timedelta(days=1)
+	return days
+
+
+def extend_schedule_with_forecast(days: List[ScheduleDay]) -> List[ScheduleDay]:
+	if not days:
+		return []
+	ordered_days = sorted(days, key=lambda item: item.shift_date)
+	last_day = ordered_days[-1]
+	cycle_position = infer_cycle_position(ordered_days)
+	extended = list(ordered_days)
+	for step in range(1, FORECAST_DAYS + 1):
+		next_date = last_day.shift_date + timedelta(days=step)
+		next_status = SHIFT_CYCLE[(cycle_position + step) % len(SHIFT_CYCLE)]
+		extended.append(
+			ScheduleDay(
+				employee=last_day.employee,
+				shift_date=next_date,
+				raw_shift=next_status,
+			)
+		)
+	return extended
+
+
+def build_forecast_shifts(days: List[ScheduleDay]) -> List[ScheduleShift]:
+	shifts: List[ScheduleShift] = []
+	for day in days:
+		if day.raw_shift.casefold() == "выходной":
+			continue
+		shifts.append(build_shift(day.employee, day.shift_date, day.raw_shift))
+	return shifts
+
+
 def schedule_event_payload(shift: ScheduleShift, source_info: Optional[str]) -> Dict:
 	timezone = google_calendar_timezone()
 	start_at = shift.start_at.replace(tzinfo=calendar_zoneinfo())
 	end_at = shift.end_at.replace(tzinfo=calendar_zoneinfo())
+	color_id = schedule_shift_color_id(shift.raw_shift)
 	description_lines = [
 		f"Employee: {shift.employee}",
 		f"Shift date: {shift.shift_date.isoformat()}",
@@ -412,7 +518,7 @@ def schedule_event_payload(shift: ScheduleShift, source_info: Optional[str]) -> 
 	]
 	if source_info:
 		description_lines.append(f"SD info: {source_info}")
-	return {
+	payload = {
 		"id": schedule_event_id(shift.schedule_key),
 		"summary": f"Смена: {shift.employee}",
 		"description": "\n".join(description_lines),
@@ -428,9 +534,12 @@ def schedule_event_payload(shift: ScheduleShift, source_info: Optional[str]) -> 
 			}
 		},
 	}
+	if color_id:
+		payload["colorId"] = color_id
+	return payload
 
 
-def list_synced_calendar_events(date_from: datetime, date_to: datetime) -> List[Dict]:
+def list_calendar_events(date_from: datetime, date_to: datetime) -> List[Dict]:
 	calendar_id = quote(google_calendar_id(), safe="")
 	zone = calendar_zoneinfo()
 	start_value = date_from.replace(tzinfo=zone).isoformat()
@@ -448,10 +557,7 @@ def list_synced_calendar_events(date_from: datetime, date_to: datetime) -> List[
 		if page_token:
 			params["pageToken"] = page_token
 		payload = google_calendar_request("GET", f"calendars/{calendar_id}/events", params=params)
-		for item in payload.get("items", []):
-			private_props = (((item.get("extendedProperties") or {}).get("private")) or {})
-			if private_props.get("source") == GCAL_SYNC_SOURCE:
-				items.append(item)
+		items.extend(payload.get("items", []))
 		page_token = payload.get("nextPageToken")
 		if not page_token:
 			return items
@@ -461,6 +567,7 @@ def sync_schedule_to_google_calendar(
 	shifts: List[ScheduleShift],
 	source_info: Optional[str],
 	schedule_dates: List[date],
+	manual_skip_dates: Optional[Set[date]] = None,
 ) -> Dict[str, int]:
 	if schedule_dates:
 		range_start = datetime.combine(min(schedule_dates), dt_time.min) - timedelta(days=1)
@@ -470,7 +577,13 @@ def sync_schedule_to_google_calendar(
 		range_end = max(shift.end_at for shift in shifts) + timedelta(days=1)
 	else:
 		return {"created": 0, "updated": 0, "deleted": 0}
-	existing_events = list_synced_calendar_events(range_start, range_end)
+	manual_skip_dates = manual_skip_dates or set()
+	all_events = list_calendar_events(range_start, range_end)
+	existing_events = []
+	for item in all_events:
+		private_props = (((item.get("extendedProperties") or {}).get("private")) or {})
+		if private_props.get("source") == GCAL_SYNC_SOURCE:
+			existing_events.append(item)
 	desired_by_key = {shift.schedule_key: shift for shift in shifts}
 	existing_by_key: Dict[str, List[Dict]] = {}
 	for item in existing_events:
@@ -486,6 +599,8 @@ def sync_schedule_to_google_calendar(
 	deleted = 0
 
 	for schedule_key, shift in desired_by_key.items():
+		if shift.shift_date in manual_skip_dates:
+			continue
 		payload = schedule_event_payload(shift, source_info)
 		current_items = existing_by_key.get(schedule_key, [])
 		if not current_items:
@@ -530,16 +645,38 @@ def sync_schedule_to_google_calendar(
 
 def handle_schedule_message(chat_id: int, text: str) -> None:
 	send_chat_action(chat_id, "typing")
-	shifts, off_days, source_info, schedule_dates = parse_schedule_message(text)
-	stats = sync_schedule_to_google_calendar(shifts, source_info, schedule_dates)
+	shifts, off_days, source_info, schedule_dates, days = parse_schedule_message(text)
+	extended_days = extend_schedule_with_forecast(days)
+	forecast_days = extended_days[len(days):]
+	forecast_shifts = build_forecast_shifts(forecast_days)
+	forecast_skip_dates: Set[date] = set()
+	if forecast_days:
+		forecast_start = datetime.combine(forecast_days[0].shift_date, dt_time.min)
+		forecast_end = datetime.combine(forecast_days[-1].shift_date, dt_time.max) + timedelta(days=1)
+		for item in list_calendar_events(forecast_start, forecast_end):
+			private_props = (((item.get("extendedProperties") or {}).get("private")) or {})
+			if private_props.get("source") == GCAL_SYNC_SOURCE:
+				continue
+			forecast_skip_dates.update(manual_event_dates(item))
+	forecast_skipped_count = sum(1 for shift in forecast_shifts if shift.shift_date in forecast_skip_dates)
+	all_shifts = shifts + [shift for shift in forecast_shifts if shift.shift_date not in forecast_skip_dates]
+	all_dates = schedule_dates + [day.shift_date for day in forecast_days]
+	stats = sync_schedule_to_google_calendar(
+		all_shifts,
+		source_info,
+		all_dates,
+		manual_skip_dates=forecast_skip_dates,
+	)
 	first_day = min(schedule_dates) if schedule_dates else None
-	last_day = max(schedule_dates) if schedule_dates else None
+	last_day = max(all_dates) if all_dates else None
 	period = f"{first_day.isoformat()} .. {last_day.isoformat()}" if first_day and last_day else "n/a"
 	send_message(
 		chat_id,
 		"Расписание синхронизировано с Google Calendar.\n"
 		f"Период: {period}\n"
-		f"Смен: {len(shifts)}\n"
+		f"Смен из сообщения: {len(shifts)}\n"
+		f"Автодобавлено вперёд: {len(forecast_shifts) - forecast_skipped_count}\n"
+		f"Пропущено из-за ручных исключений: {forecast_skipped_count}\n"
 		f"Выходных пропущено: {off_days}\n"
 		f"Создано: {stats['created']}\n"
 		f"Обновлено: {stats['updated']}\n"
