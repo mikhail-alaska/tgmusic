@@ -633,6 +633,10 @@ def schedule_event_payload(shift: ScheduleShift, source_info: Optional[str]) -> 
 		"description": "\n".join(description_lines),
 		"start": {"dateTime": start_at.isoformat(), "timeZone": timezone},
 		"end": {"dateTime": end_at.isoformat(), "timeZone": timezone},
+		"reminders": {
+			"useDefault": False,
+			"overrides": [{"method": "popup", "minutes": 10}],
+		},
 		"extendedProperties": {
 			"private": {
 				"source": GCAL_SYNC_SOURCE,
@@ -646,6 +650,28 @@ def schedule_event_payload(shift: ScheduleShift, source_info: Optional[str]) -> 
 	if color_id:
 		payload["colorId"] = color_id
 	return payload
+
+
+def calendar_event_start_text(event: Dict) -> str:
+	start = event.get("start") or {}
+	value = str(start.get("dateTime") or start.get("date") or "").strip()
+	if not value:
+		return "без даты"
+	try:
+		parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+	except ValueError:
+		return value
+	if parsed.tzinfo:
+		parsed = parsed.astimezone(calendar_zoneinfo())
+	return parsed.strftime("%Y-%m-%d %H:%M")
+
+
+def describe_deleted_calendar_event(event: Dict, reason: str) -> str:
+	summary = str(event.get("summary") or "Без названия").strip()
+	private_props = (((event.get("extendedProperties") or {}).get("private")) or {})
+	raw_shift = str(private_props.get("raw_shift") or "").strip()
+	shift_suffix = f", {raw_shift}" if raw_shift else ""
+	return f"{calendar_event_start_text(event)} — {summary}{shift_suffix} ({reason})"
 
 
 def list_calendar_events(date_from: datetime, date_to: datetime) -> List[Dict]:
@@ -676,7 +702,7 @@ def sync_schedule_to_google_calendar(
 	shifts: List[ScheduleShift],
 	source_info: Optional[str],
 	schedule_dates: List[date],
-) -> Dict[str, int]:
+) -> Dict[str, object]:
 	if schedule_dates:
 		range_start = datetime.combine(min(schedule_dates), dt_time.min) - timedelta(days=1)
 		range_end = datetime.combine(max(schedule_dates), dt_time.max) + timedelta(days=1)
@@ -684,7 +710,7 @@ def sync_schedule_to_google_calendar(
 		range_start = min(shift.start_at for shift in shifts) - timedelta(days=1)
 		range_end = max(shift.end_at for shift in shifts) + timedelta(days=1)
 	else:
-		return {"created": 0, "updated": 0, "deleted": 0}
+		return {"created": 0, "updated": 0, "deleted": 0, "deleted_events": []}
 	all_events = list_calendar_events(range_start, range_end)
 	existing_events = []
 	for item in all_events:
@@ -704,6 +730,7 @@ def sync_schedule_to_google_calendar(
 	created = 0
 	updated = 0
 	deleted = 0
+	deleted_events: List[str] = []
 
 	for schedule_key, shift in desired_by_key.items():
 		payload = schedule_event_payload(shift, source_info)
@@ -716,6 +743,7 @@ def sync_schedule_to_google_calendar(
 		for duplicate in current_items[1:]:
 			duplicate_id = duplicate.get("id")
 			if duplicate_id:
+				deleted_events.append(describe_deleted_calendar_event(duplicate, "дубликат"))
 				google_calendar_request("DELETE", f"calendars/{calendar_id}/events/{quote(str(duplicate_id), safe='')}")
 				deleted += 1
 		private_props = (((primary.get("extendedProperties") or {}).get("private")) or {})
@@ -725,6 +753,7 @@ def sync_schedule_to_google_calendar(
 				((primary.get("start") or {}).get("dateTime") or "") != payload["start"]["dateTime"],
 				((primary.get("end") or {}).get("dateTime") or "") != payload["end"]["dateTime"],
 				((primary.get("description") or "") != payload["description"]),
+				(primary.get("reminders") or {}) != payload["reminders"],
 				str(primary.get("colorId") or "") != str(payload.get("colorId") or ""),
 				private_props.get("source_info", "") != (source_info or ""),
 			)
@@ -743,10 +772,11 @@ def sync_schedule_to_google_calendar(
 		for item in current_items:
 			event_id = item.get("id")
 			if event_id:
+				deleted_events.append(describe_deleted_calendar_event(item, "нет в новом расписании"))
 				google_calendar_request("DELETE", f"calendars/{calendar_id}/events/{quote(str(event_id), safe='')}")
 				deleted += 1
 
-	return {"created": created, "updated": updated, "deleted": deleted}
+	return {"created": created, "updated": updated, "deleted": deleted, "deleted_events": deleted_events}
 
 
 def handle_schedule_message(chat_id: int, text: str) -> None:
@@ -761,6 +791,13 @@ def handle_schedule_message(chat_id: int, text: str) -> None:
 	first_day = min(schedule_dates) if schedule_dates else None
 	last_day = max(all_dates) if all_dates else None
 	period = f"{first_day.isoformat()} .. {last_day.isoformat()}" if first_day and last_day else "n/a"
+	deleted_events = list(stats.get("deleted_events") or [])
+	deleted_details = ""
+	if deleted_events:
+		visible_deleted = deleted_events[:20]
+		deleted_details = "\n\nУдалено:\n" + "\n".join(f"- {item}" for item in visible_deleted)
+		if len(deleted_events) > len(visible_deleted):
+			deleted_details += f"\n- ... и еще {len(deleted_events) - len(visible_deleted)}"
 	send_message(
 		chat_id,
 		"Расписание синхронизировано с Google Calendar.\n"
@@ -770,7 +807,8 @@ def handle_schedule_message(chat_id: int, text: str) -> None:
 		f"Выходных пропущено: {off_days}\n"
 		f"Создано: {stats['created']}\n"
 		f"Обновлено: {stats['updated']}\n"
-		f"Удалено старых: {stats['deleted']}",
+		f"Удалено старых: {stats['deleted']}"
+		f"{deleted_details}",
 	)
 
 
