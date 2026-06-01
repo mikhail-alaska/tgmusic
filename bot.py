@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -23,7 +24,15 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from ytmusicapi import YTMusic
 
-PROXY_URL = "http://127.0.0.1:2080"
+PROXY_ENV = "PROXY_URL"
+PROXY_ENV_VARS = (
+	"HTTP_PROXY",
+	"HTTPS_PROXY",
+	"ALL_PROXY",
+	"http_proxy",
+	"https_proxy",
+	"all_proxy",
+)
 BOT_API_BASE = "https://api.telegram.org"
 ALLOWED_USER_ID = 517539052
 SEARCH_LIMIT = 10
@@ -123,13 +132,55 @@ class TelegramApiError(RuntimeError):
 PENDING_BY_CHAT: Dict[int, PendingChoice] = {}
 
 
+def proxy_url() -> str:
+	return os.environ.get(PROXY_ENV, "").strip()
+
+
+def proxy_is_available(proxy: str) -> bool:
+	try:
+		parsed = urlparse(proxy)
+		host = parsed.hostname
+		port = parsed.port
+		if not host:
+			return False
+		if port is None:
+			port = 443 if parsed.scheme == "https" else 80
+		with socket.create_connection((host, port), timeout=1):
+			return True
+	except OSError:
+		return False
+
+
+def effective_proxy_url() -> str:
+	proxy = proxy_url()
+	if not proxy:
+		return ""
+	if proxy_is_available(proxy):
+		return proxy
+	print(f"Proxy {proxy} is configured but unavailable; using direct connection.", file=sys.stderr)
+	return ""
+
+
 def configure_proxy() -> None:
-	os.environ["HTTP_PROXY"] = PROXY_URL
-	os.environ["HTTPS_PROXY"] = PROXY_URL
-	os.environ["ALL_PROXY"] = PROXY_URL
-	os.environ["http_proxy"] = PROXY_URL
-	os.environ["https_proxy"] = PROXY_URL
-	os.environ["all_proxy"] = PROXY_URL
+	proxy = effective_proxy_url()
+	if not proxy:
+		for name in PROXY_ENV_VARS:
+			os.environ.pop(name, None)
+		return
+	for name in PROXY_ENV_VARS:
+		os.environ[name] = proxy
+
+
+def subprocess_env() -> Dict[str, str]:
+	env = os.environ.copy()
+	proxy = effective_proxy_url()
+	if proxy:
+		for name in PROXY_ENV_VARS:
+			env[name] = proxy
+	else:
+		for name in PROXY_ENV_VARS:
+			env.pop(name, None)
+	return env
 
 
 def load_dotenv() -> None:
@@ -162,7 +213,10 @@ def bot_token() -> str:
 
 def session() -> requests.Session:
 	s = requests.Session()
-	s.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
+	s.trust_env = False
+	proxy = effective_proxy_url()
+	if proxy:
+		s.proxies.update({"http": proxy, "https": proxy})
 	retry_kwargs = {
 		"total": 3,
 		"connect": 3,
@@ -183,6 +237,12 @@ def session() -> requests.Session:
 
 
 HTTP = session()
+
+
+def configure_http_session() -> None:
+	global HTTP
+	configure_proxy()
+	HTTP = session()
 
 
 def sanitize_error_message(exc: Exception) -> str:
@@ -955,13 +1015,12 @@ def probe_video_metadata(url: str, video_id: str) -> Tuple[str, str]:
 	yt_bin = ytdlp_path()
 	cmd = [
 		yt_bin,
-		"--proxy",
-		PROXY_URL,
 		"--dump-single-json",
 		"--no-playlist",
-		url,
 	]
-	proc = subprocess.run(cmd, capture_output=True, text=True)
+	add_proxy_args(cmd)
+	cmd.append(url)
+	proc = subprocess.run(cmd, capture_output=True, text=True, env=subprocess_env())
 	if proc.returncode != 0:
 		return f"YouTube {video_id}", "YouTube"
 
@@ -1050,6 +1109,7 @@ def probe_ytdlp_status() -> str:
 			capture_output=True,
 			text=True,
 			timeout=10,
+			env=subprocess_env(),
 		)
 	except Exception as exc:
 		return f"error: {exc}"
@@ -1112,20 +1172,25 @@ def social_media_fallback_name(url: str) -> str:
 	return sanitize_name(f"{host_name}_media")
 
 
+def add_proxy_args(cmd: List[str]) -> None:
+	proxy = effective_proxy_url()
+	if proxy:
+		cmd.extend(["--proxy", proxy])
+
+
 def social_media_base_name(url: str) -> str:
 	yt_bin = ytdlp_path()
 	cmd = [
 		yt_bin,
 		"--dump-single-json",
-		"--proxy",
-		PROXY_URL,
 		"--no-playlist",
 		"--socket-timeout",
 		"30",
-		url,
 	]
+	add_proxy_args(cmd)
+	cmd.append(url)
 	try:
-		proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+		proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45, env=subprocess_env())
 		if proc.returncode != 0:
 			return social_media_fallback_name(url)
 		payload = json.loads(proc.stdout)
@@ -1177,8 +1242,6 @@ def download_audio(video_id: str, title: str, artist: str, out_dir: pathlib.Path
 				yt_bin,
 				"-f",
 				"ba[ext=m4a]/bestaudio[ext=m4a]/bestaudio",
-				"--proxy",
-				PROXY_URL,
 				"--no-playlist",
 				"--force-overwrites",
 				"--retries",
@@ -1191,9 +1254,10 @@ def download_audio(video_id: str, title: str, artist: str, out_dir: pathlib.Path
 				f"youtube:player_client={client}",
 				"-o",
 				out_template,
-				base_url,
 			]
-			proc = subprocess.run(cmd, capture_output=True, text=True)
+			add_proxy_args(cmd)
+			cmd.append(base_url)
+			proc = subprocess.run(cmd, capture_output=True, text=True, env=subprocess_env())
 			if proc.returncode == 0:
 				files = sorted(out_dir.glob(f"{base_name}.*"), key=lambda path: path.stat().st_mtime, reverse=True)
 				if files:
@@ -1212,8 +1276,6 @@ def download_social_media(url: str, out_dir: pathlib.Path) -> List[pathlib.Path]
 		yt_bin,
 		"--merge-output-format",
 		"mp4",
-		"--proxy",
-		PROXY_URL,
 		"--no-playlist",
 		"--force-overwrites",
 		"--retries",
@@ -1224,9 +1286,10 @@ def download_social_media(url: str, out_dir: pathlib.Path) -> List[pathlib.Path]
 		"30",
 		"-o",
 		out_template,
-		url,
 	]
-	proc = subprocess.run(cmd, capture_output=True, text=True)
+	add_proxy_args(cmd)
+	cmd.append(url)
+	proc = subprocess.run(cmd, capture_output=True, text=True, env=subprocess_env())
 	if proc.returncode != 0:
 		detail = (proc.stderr or proc.stdout or "").strip()[-700:]
 		raise RuntimeError(f"yt-dlp failed: {detail}")
@@ -1507,7 +1570,7 @@ def handle_message(message: Dict) -> None:
 
 def run_bot() -> int:
 	load_dotenv()
-	configure_proxy()
+	configure_http_session()
 	offset = None
 	consecutive_errors = 0
 	print(f"Bot started. Allowed user id: {ALLOWED_USER_ID}")
