@@ -19,6 +19,8 @@ import requests
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import APIC, ID3
 from mutagen.mp4 import MP4, MP4Cover
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from ytmusicapi import YTMusic
 
 PROXY_URL = "http://127.0.0.1:2080"
@@ -30,6 +32,7 @@ YTM_URL = "https://music.youtube.com/watch?v={vid}"
 YT_URL = "https://www.youtube.com/watch?v={vid}"
 YOUTUBE_CLIENTS = ["ios", "tv_embedded", "webremix"]
 POLL_TIMEOUT_S = 30
+HTTP_TIMEOUT_S = 75
 STARTED_AT = time.time()
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3"
@@ -101,6 +104,22 @@ class ScheduleDay:
 	raw_shift: str
 
 
+class GoogleCalendarConfigError(RuntimeError):
+	pass
+
+
+class GoogleCalendarAuthError(RuntimeError):
+	pass
+
+
+class GoogleCalendarApiError(RuntimeError):
+	pass
+
+
+class TelegramApiError(RuntimeError):
+	pass
+
+
 PENDING_BY_CHAT: Dict[int, PendingChoice] = {}
 
 
@@ -144,10 +163,35 @@ def bot_token() -> str:
 def session() -> requests.Session:
 	s = requests.Session()
 	s.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
+	retry_kwargs = {
+		"total": 3,
+		"connect": 3,
+		"read": 2,
+		"status": 3,
+		"backoff_factor": 1,
+		"status_forcelist": (429, 500, 502, 503, 504),
+		"respect_retry_after_header": True,
+	}
+	try:
+		retry = Retry(allowed_methods=frozenset(("GET",)), **retry_kwargs)
+	except TypeError:
+		retry = Retry(method_whitelist=frozenset(("GET",)), **retry_kwargs)
+	adapter = HTTPAdapter(max_retries=retry)
+	s.mount("http://", adapter)
+	s.mount("https://", adapter)
 	return s
 
 
 HTTP = session()
+
+
+def sanitize_error_message(exc: Exception) -> str:
+	message = str(exc)
+	token = os.environ.get("TG_BOT_TOKEN", "").strip()
+	if token:
+		message = message.replace(token, "<TG_BOT_TOKEN>")
+	message = re.sub(r"/bot[^/\s>]+", "/bot<TG_BOT_TOKEN>", message)
+	return message
 
 
 def api_url(method: str) -> str:
@@ -159,28 +203,34 @@ def file_api_url(file_token: str) -> str:
 
 
 def api_call(method: str, *, data=None, files=None, timeout: int = 60) -> Dict:
-	resp = HTTP.post(api_url(method), data=data, files=files, timeout=timeout)
-	resp.raise_for_status()
+	try:
+		resp = HTTP.post(api_url(method), data=data, files=files, timeout=timeout)
+		resp.raise_for_status()
+	except requests.RequestException as exc:
+		raise TelegramApiError(f"Telegram API error in {method}: {sanitize_error_message(exc)}") from exc
 	payload = resp.json()
 	if not payload.get("ok"):
-		raise RuntimeError(f"Telegram API error in {method}: {payload}")
+		raise TelegramApiError(f"Telegram API error in {method}: {payload}")
 	return payload["result"]
 
 
 def get_updates(offset: Optional[int]) -> List[Dict]:
-	resp = HTTP.get(
-		api_url("getUpdates"),
-		params={
-			"offset": offset,
-			"timeout": POLL_TIMEOUT_S,
-			"allowed_updates": json.dumps(["message", "callback_query"]),
-		},
-		timeout=POLL_TIMEOUT_S + 10,
-	)
-	resp.raise_for_status()
+	try:
+		resp = HTTP.get(
+			api_url("getUpdates"),
+			params={
+				"offset": offset,
+				"timeout": POLL_TIMEOUT_S,
+				"allowed_updates": json.dumps(["message", "callback_query"]),
+			},
+			timeout=HTTP_TIMEOUT_S,
+		)
+		resp.raise_for_status()
+	except requests.RequestException as exc:
+		raise TelegramApiError(f"Telegram getUpdates failed: {sanitize_error_message(exc)}") from exc
 	payload = resp.json()
 	if not payload.get("ok"):
-		raise RuntimeError(f"Telegram API error in getUpdates: {payload}")
+		raise TelegramApiError(f"Telegram API error in getUpdates: {payload}")
 	return payload["result"]
 
 
@@ -302,6 +352,30 @@ def calendar_zoneinfo() -> ZoneInfo:
 	return ZoneInfo(google_calendar_timezone())
 
 
+def google_error_detail(resp: requests.Response) -> str:
+	try:
+		payload = resp.json()
+	except ValueError:
+		text = resp.text.strip()
+		return text[:500] if text else resp.reason
+	if isinstance(payload, dict):
+		error = str(payload.get("error") or "").strip()
+		description = str(payload.get("error_description") or payload.get("message") or "").strip()
+		if error and description:
+			return f"{error}: {description}"
+		if error:
+			return error
+		return json.dumps(payload, ensure_ascii=False)
+	return str(payload)
+
+
+def raise_google_response_error(resp: requests.Response, error_cls, context: str) -> None:
+	if resp.status_code < 400:
+		return
+	detail = google_error_detail(resp)
+	raise error_cls(f"{context}: HTTP {resp.status_code} {resp.reason}; {detail}")
+
+
 def google_access_token() -> str:
 	client_id = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
 	client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
@@ -316,7 +390,7 @@ def google_access_token() -> str:
 		if not value
 	]
 	if missing:
-		raise RuntimeError("Missing Google Calendar settings: " + ", ".join(missing))
+		raise GoogleCalendarConfigError("Missing Google Calendar settings: " + ", ".join(missing))
 	resp = HTTP.post(
 		GOOGLE_TOKEN_URL,
 		data={
@@ -327,11 +401,11 @@ def google_access_token() -> str:
 		},
 		timeout=30,
 	)
-	resp.raise_for_status()
+	raise_google_response_error(resp, GoogleCalendarAuthError, "Google OAuth token request failed")
 	payload = resp.json()
 	access_token = str(payload.get("access_token") or "").strip()
 	if not access_token:
-		raise RuntimeError(f"Google token response has no access_token: {payload}")
+		raise GoogleCalendarAuthError(f"Google token response has no access_token: {payload}")
 	return access_token
 
 
@@ -353,7 +427,7 @@ def google_calendar_request(
 		},
 		timeout=60,
 	)
-	resp.raise_for_status()
+	raise_google_response_error(resp, GoogleCalendarApiError, f"Google Calendar API {method} {path} failed")
 	if resp.status_code == 204 or not resp.content:
 		return {}
 	return resp.json()
@@ -637,6 +711,39 @@ def handle_schedule_message(chat_id: int, text: str) -> None:
 		f"Создано: {stats['created']}\n"
 		f"Обновлено: {stats['updated']}\n"
 		f"Удалено старых: {stats['deleted']}",
+	)
+
+
+def format_schedule_sync_error(exc: Exception) -> str:
+	base = (
+		"Не удалось синхронизировать расписание в Google Calendar.\n"
+		f"Ошибка: {exc}"
+	)
+	if isinstance(exc, GoogleCalendarAuthError):
+		return (
+			base
+			+ "\n\n"
+			+ "Проблема на этапе OAuth-токена. Проверь, что GOOGLE_CLIENT_ID и "
+			"GOOGLE_CLIENT_SECRET относятся к тому же OAuth client, для которого был "
+			"получен GOOGLE_REFRESH_TOKEN. Если Google вернул invalid_grant, refresh "
+			"token нужно выпустить заново через refresh.py."
+		)
+	if isinstance(exc, GoogleCalendarConfigError):
+		return base + "\n\nПроверь переменные GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN."
+	if isinstance(exc, GoogleCalendarApiError):
+		return (
+			base
+			+ "\n\n"
+			+ "OAuth прошел, но Calendar API отклонил запрос. Проверь GOOGLE_CALENDAR_ID, "
+			"права календаря и доступность Google Calendar API в проекте."
+		)
+	if isinstance(exc, ValueError):
+		return base + "\n\nПроверь формат сообщения с расписанием."
+	return (
+		base
+		+ "\n\n"
+		+ "Проверь формат сообщения и настройки Google Calendar: GOOGLE_CLIENT_ID, "
+		"GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN."
 	)
 
 
@@ -969,7 +1076,13 @@ def probe_google_calendar_status() -> str:
 	missing = [name for name in required if not os.environ.get(name, "").strip()]
 	if missing:
 		return "missing " + ", ".join(missing)
-	return f"configured (calendar={google_calendar_id()}, tz={google_calendar_timezone()})"
+	try:
+		google_access_token()
+	except (GoogleCalendarAuthError, GoogleCalendarConfigError) as exc:
+		return f"auth error: {exc}"
+	except Exception as exc:
+		return f"check error: {sanitize_error_message(exc)}"
+	return f"ok (calendar={google_calendar_id()}, tz={google_calendar_timezone()})"
 
 
 def build_status_text() -> str:
@@ -1300,22 +1413,25 @@ def handle_social_video_link(chat_id: int, url: str) -> None:
 	send_message(chat_id, "Downloading media...")
 	send_chat_action(chat_id, "upload_document")
 
-	with tempfile.TemporaryDirectory(prefix="tgsocial-") as tmpdir:
-		tmp_path = pathlib.Path(tmpdir)
-		output_files = download_social_media(url, tmp_path)
-		try:
-			if can_send_as_media_group(output_files):
-				send_media_group(chat_id, output_files, caption=url)
-			else:
-				for index, output_file in enumerate(output_files):
-					caption = url if index == 0 and len(output_files) > 1 else None
-					send_social_media(chat_id, output_file, caption)
-		finally:
-			for output_file in output_files:
-				try:
-					output_file.unlink()
-				except Exception:
-					pass
+	try:
+		with tempfile.TemporaryDirectory(prefix="tgsocial-") as tmpdir:
+			tmp_path = pathlib.Path(tmpdir)
+			output_files = download_social_media(url, tmp_path)
+			try:
+				if can_send_as_media_group(output_files):
+					send_media_group(chat_id, output_files, caption=url)
+				else:
+					for index, output_file in enumerate(output_files):
+						caption = url if index == 0 and len(output_files) > 1 else None
+						send_social_media(chat_id, output_file, caption)
+			finally:
+				for output_file in output_files:
+					try:
+						output_file.unlink()
+					except Exception:
+						pass
+	except RuntimeError as exc:
+		send_message(chat_id, f"Не удалось скачать медиа.\nОшибка: {sanitize_error_message(exc)}")
 
 
 def extract_message(update: Dict) -> Optional[Dict]:
@@ -1371,12 +1487,7 @@ def handle_message(message: Dict) -> None:
 		try:
 			handle_schedule_message(chat_id, text)
 		except Exception as exc:
-			send_message(
-				chat_id,
-				"Не удалось синхронизировать расписание в Google Calendar.\n"
-				f"Ошибка: {exc}\n\n"
-				"Проверь формат сообщения и переменные GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN.",
-			)
+			send_message(chat_id, format_schedule_sync_error(exc))
 		return
 
 	if re.fullmatch(r"\d+", text):
@@ -1398,27 +1509,41 @@ def run_bot() -> int:
 	load_dotenv()
 	configure_proxy()
 	offset = None
+	consecutive_errors = 0
 	print(f"Bot started. Allowed user id: {ALLOWED_USER_ID}")
 	while True:
 		try:
 			cleanup_old_pending()
 			updates = get_updates(offset)
+			consecutive_errors = 0
 			for update in updates:
 				offset = update["update_id"] + 1
-				callback_query = update.get("callback_query")
-				if isinstance(callback_query, dict):
-					handle_callback_query(callback_query)
-					continue
-				message = extract_message(update)
-				if message is None:
-					continue
-				handle_message(message)
+				try:
+					callback_query = update.get("callback_query")
+					if isinstance(callback_query, dict):
+						handle_callback_query(callback_query)
+						continue
+					message = extract_message(update)
+					if message is None:
+						continue
+					handle_message(message)
+				except Exception as exc:
+					print(
+						f"Update handling error ({type(exc).__name__}, update_id={update.get('update_id')}): "
+						f"{sanitize_error_message(exc)}",
+						file=sys.stderr,
+					)
 		except KeyboardInterrupt:
 			print("Bot stopped.")
 			return 0
 		except Exception as exc:
-			print(f"Bot loop error: {exc}", file=sys.stderr)
-			time.sleep(3)
+			consecutive_errors += 1
+			delay = min(60, 3 * (2 ** min(consecutive_errors - 1, 4)))
+			print(
+				f"Bot loop error ({type(exc).__name__}, retry in {delay}s): {sanitize_error_message(exc)}",
+				file=sys.stderr,
+			)
+			time.sleep(delay)
 
 
 if __name__ == "__main__":

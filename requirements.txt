@@ -1,3 +1,4 @@
 requests
 mutagen
 ytmusicapi
+google-auth-oauthlib
