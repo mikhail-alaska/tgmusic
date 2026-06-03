@@ -84,6 +84,85 @@ PENALTY_TERMS = {
 	"tribute",
 	"soundalike",
 }
+UNKNOWN_ARTIST_VALUES = {
+	"",
+	"unknown artist",
+	"unknown",
+	"youtube",
+	"music",
+}
+GENERIC_TITLE_SUFFIX_RE = re.compile(
+	r"(?:\s*[\(\[]\s*(?:lyrics?|official(?:\s+(?:video|audio|music\s+video))?|audio|music\s+video|visualizer)\s*[\)\]]|\s*[•-]\s*(?:full\s+)?lyrics?)\s*$",
+	flags=re.I,
+)
+CYRILLIC_TRANSLIT = {
+	"А": "A",
+	"Б": "B",
+	"В": "V",
+	"Г": "G",
+	"Д": "D",
+	"Е": "E",
+	"Ё": "E",
+	"Ж": "Zh",
+	"З": "Z",
+	"И": "I",
+	"Й": "Y",
+	"К": "K",
+	"Л": "L",
+	"М": "M",
+	"Н": "N",
+	"О": "O",
+	"П": "P",
+	"Р": "R",
+	"С": "S",
+	"Т": "T",
+	"У": "U",
+	"Ф": "F",
+	"Х": "Kh",
+	"Ц": "Ts",
+	"Ч": "Ch",
+	"Ш": "Sh",
+	"Щ": "Sch",
+	"Ъ": "",
+	"Ы": "Y",
+	"Ь": "",
+	"Э": "E",
+	"Ю": "Yu",
+	"Я": "Ya",
+	"а": "a",
+	"б": "b",
+	"в": "v",
+	"г": "g",
+	"д": "d",
+	"е": "e",
+	"ё": "e",
+	"ж": "zh",
+	"з": "z",
+	"и": "i",
+	"й": "y",
+	"к": "k",
+	"л": "l",
+	"м": "m",
+	"н": "n",
+	"о": "o",
+	"п": "p",
+	"р": "r",
+	"с": "s",
+	"т": "t",
+	"у": "u",
+	"ф": "f",
+	"х": "kh",
+	"ц": "ts",
+	"ч": "ch",
+	"ш": "sh",
+	"щ": "sch",
+	"ъ": "",
+	"ы": "y",
+	"ь": "",
+	"э": "e",
+	"ю": "yu",
+	"я": "ya",
+}
 
 
 @dataclass
@@ -919,10 +998,49 @@ def candidate_artist_text(candidate: Dict) -> str:
 	return candidate.get("author", "") or ""
 
 
+def is_unknown_artist(artist: str) -> bool:
+	return (artist or "").strip().lower() in UNKNOWN_ARTIST_VALUES
+
+
+def clean_track_title(title: str) -> str:
+	cleaned = (title or "").strip()
+	while True:
+		next_value = GENERIC_TITLE_SUFFIX_RE.sub("", cleaned).strip()
+		if next_value == cleaned:
+			return cleaned
+		cleaned = next_value
+
+
+def parse_artist_title(title: str) -> Optional[Tuple[str, str]]:
+	parts = re.split(r"\s+[-–—]\s+", title or "", maxsplit=1)
+	if len(parts) != 2:
+		return None
+	artist, parsed_title = (part.strip() for part in parts)
+	if not artist or not parsed_title:
+		return None
+	return artist, clean_track_title(parsed_title)
+
+
+def normalized_track_metadata(title: str, artist: str) -> Tuple[str, str]:
+	title = clean_track_title(str(title or "").strip())
+	artist = str(artist or "").strip()
+	if is_unknown_artist(artist):
+		parsed = parse_artist_title(title)
+		if parsed:
+			artist, title = parsed
+	return title or "Unknown title", artist or "Unknown artist"
+
+
+def candidate_track_metadata(candidate: Dict) -> Tuple[str, str]:
+	return normalized_track_metadata(
+		candidate.get("title") or "",
+		candidate_artist_text(candidate),
+	)
+
+
 def score_candidate(search_query: str, candidate: Dict) -> float:
 	query_tokens = toks(search_query)
-	candidate_title = candidate.get("title") or ""
-	candidate_artist = candidate_artist_text(candidate)
+	candidate_title, candidate_artist = candidate_track_metadata(candidate)
 	title_overlap = overlap_ratio(query_tokens, toks(candidate_title))
 	artist_overlap = overlap_ratio(query_tokens, toks(candidate_artist))
 	yt_duration = duration_s(candidate.get("duration_seconds"))
@@ -994,6 +1112,25 @@ def sanitize_name(name: str) -> str:
 	cleaned = re.sub(r'[\\/:*?"<>|]+', "_", name or "")
 	cleaned = re.sub(r"\s+", " ", cleaned).strip().strip(".")
 	return cleaned[:120] or "file"
+
+
+def transliterate_latin(text: str) -> str:
+	return "".join(CYRILLIC_TRANSLIT.get(char, char) for char in text or "")
+
+
+def sanitize_filename_component(name: str) -> str:
+	cleaned = transliterate_latin(name)
+	cleaned = re.sub(r'[\\/:*?"<>|]+', "_", cleaned)
+	cleaned = re.sub(r"[^\x00-\x7F]+", "", cleaned)
+	cleaned = re.sub(r"\s+", "_", cleaned).strip().strip("._")
+	cleaned = re.sub(r"_+", "_", cleaned)
+	return cleaned or "Unknown"
+
+
+def audio_base_name(title: str, artist: str) -> str:
+	artist_part = sanitize_filename_component(artist)
+	title_part = sanitize_filename_component(title)
+	return sanitize_name(f"{artist_part}_{title_part}")
 
 
 def is_youtube_url(text: str) -> bool:
@@ -1074,7 +1211,7 @@ def probe_video_metadata(url: str, video_id: str) -> Tuple[str, str]:
 		or payload.get("channel")
 		or "YouTube"
 	)
-	return str(title).strip() or f"YouTube {video_id}", str(artist).strip() or "YouTube"
+	return normalized_track_metadata(str(title).strip() or f"YouTube {video_id}", str(artist).strip() or "YouTube")
 
 
 def yt_thumbnail_bytes(video_id: str) -> Optional[bytes]:
@@ -1269,7 +1406,7 @@ def rename_social_media_files(files: List[pathlib.Path], base_name: str) -> List
 
 def download_audio(video_id: str, title: str, artist: str, out_dir: pathlib.Path) -> pathlib.Path:
 	out_dir.mkdir(parents=True, exist_ok=True)
-	base_name = sanitize_name(f"{artist} - {title}")
+	base_name = audio_base_name(title, artist)
 	out_template = str(out_dir / f"{base_name}.%(ext)s")
 	yt_bin = ytdlp_path()
 	last_error = "yt-dlp failed without error output"
@@ -1371,8 +1508,7 @@ def can_send_as_media_group(paths: List[pathlib.Path]) -> bool:
 def format_candidates(candidates: List[Dict], limit: int = 5) -> str:
 	lines = ["Tap a result button below, or reply with a number:"]
 	for index, candidate in enumerate(candidates[:limit], start=1):
-		title = candidate.get("title") or "Unknown title"
-		artist = candidate_artist_text(candidate) or "Unknown artist"
+		title, artist = candidate_track_metadata(candidate)
 		score = candidate.get("score", 0.0)
 		source = candidate.get("source") or "unknown"
 		duration = duration_s(candidate.get("duration_seconds"))
@@ -1384,8 +1520,7 @@ def format_candidates(candidates: List[Dict], limit: int = 5) -> str:
 def candidate_buttons(candidates: List[Dict], limit: int = 5) -> Dict:
 	keyboard = []
 	for index, candidate in enumerate(candidates[:limit], start=1):
-		title = candidate.get("title") or "Unknown title"
-		artist = candidate_artist_text(candidate) or "Unknown artist"
+		title, artist = candidate_track_metadata(candidate)
 		button_text = f"{index}. {artist[:20]} - {title[:24]}"
 		keyboard.append([{"text": button_text, "callback_data": f"pick:{index}"}])
 	return {"inline_keyboard": keyboard}
@@ -1432,8 +1567,9 @@ def handle_choice(chat_id: int, text: str) -> None:
 		send_message(chat_id, "That candidate has no video id.")
 		return
 
-	title = selected.get("title") or pending.query
-	artist = candidate_artist_text(selected) or "Unknown artist"
+	title, artist = candidate_track_metadata(selected)
+	if title == "Unknown title":
+		title = pending.query
 	send_message(chat_id, f"Downloading: {artist} - {title}")
 	send_chat_action(chat_id, "upload_document")
 
