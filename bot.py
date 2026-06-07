@@ -1130,7 +1130,9 @@ def sanitize_filename_component(name: str) -> str:
 def audio_base_name(title: str, artist: str) -> str:
 	artist_part = sanitize_filename_component(artist)
 	title_part = sanitize_filename_component(title)
-	return sanitize_name(f"{artist_part}_{title_part}")
+    if title_part!="Unknown":
+        return sanitize_name(f"{title_part}")
+	return sanitize_name(f"{artist_part}")
 
 
 def is_youtube_url(text: str) -> bool:
