@@ -59,6 +59,8 @@ SHIFT_CYCLE = [
 	"Выходной",
 	"Выходной",
 ]
+OFF_DAY_STATUS = "выходной"
+VACATION_STATUS = "отпуск"
 SCHEDULE_DATE_RE = re.compile(r"^📅\s*(\d{4}-\d{2}-\d{2})\s*$")
 SCHEDULE_ENTRY_RE = re.compile(
 	r"^\*\s*(?:\[(?P<name>[^\]]+)\]\([^)]+\)|(?P<plain_name>.+?))\s*—\s*(?P<shift>.+?)\s*$"
@@ -179,6 +181,7 @@ class ScheduleShift:
 	start_at: datetime
 	end_at: datetime
 	raw_shift: str
+	all_day: bool = False
 
 	@property
 	def schedule_key(self) -> str:
@@ -595,11 +598,24 @@ def build_shift(employee: str, shift_date: date, shift_text: str) -> ScheduleShi
 	)
 
 
-def parse_schedule_message(text: str) -> Tuple[List[ScheduleShift], int, Optional[str], List[date], List[ScheduleDay]]:
+def build_vacation_event(employee: str, shift_date: date, shift_text: str) -> ScheduleShift:
+	start_at = datetime.combine(shift_date, dt_time.min)
+	return ScheduleShift(
+		employee=employee,
+		shift_date=shift_date,
+		start_at=start_at,
+		end_at=start_at + timedelta(days=1),
+		raw_shift=shift_text,
+		all_day=True,
+	)
+
+
+def parse_schedule_message(text: str) -> Tuple[List[ScheduleShift], int, int, Optional[str], List[date], List[ScheduleDay]]:
 	shifts: List[ScheduleShift] = []
 	days: List[ScheduleDay] = []
 	current_date: Optional[date] = None
 	off_days = 0
+	vacation_days = 0
 	seen_dates: List[date] = []
 	info_match = SD_INFO_RE.search(text)
 	source_info = info_match.group(1) if info_match else None
@@ -623,14 +639,19 @@ def parse_schedule_message(text: str) -> Tuple[List[ScheduleShift], int, Optiona
 		if not employee:
 			raise ValueError(f"Could not parse employee name in line: {line}")
 		days.append(ScheduleDay(employee=employee, shift_date=current_date, raw_shift=shift_text))
-		if shift_text.casefold() == "выходной":
+		shift_status = shift_text.casefold()
+		if shift_status == OFF_DAY_STATUS:
 			off_days += 1
+			continue
+		if shift_status == VACATION_STATUS:
+			vacation_days += 1
+			shifts.append(build_vacation_event(employee, current_date, shift_text))
 			continue
 		shifts.append(build_shift(employee, current_date, shift_text))
 
 	if not shifts and off_days == 0:
 		raise ValueError("No schedule rows were found in the message.")
-	return shifts, off_days, source_info, seen_dates, days
+	return shifts, off_days, vacation_days, source_info, seen_dates, days
 
 
 def schedule_event_id(schedule_key: str) -> str:
@@ -639,6 +660,10 @@ def schedule_event_id(schedule_key: str) -> str:
 
 def schedule_shift_color_id(raw_shift: str) -> Optional[str]:
 	return SHIFT_COLOR_IDS.get(raw_shift)
+
+
+def is_cycle_status(raw_shift: str) -> bool:
+	return raw_shift in SHIFT_CYCLE
 
 
 def infer_cycle_position(days: List[ScheduleDay]) -> int:
@@ -669,6 +694,8 @@ def extend_schedule_with_forecast(days: List[ScheduleDay]) -> List[ScheduleDay]:
 		return []
 	ordered_days = sorted(days, key=lambda item: item.shift_date)
 	last_day = ordered_days[-1]
+	if not is_cycle_status(last_day.raw_shift):
+		return ordered_days
 	cycle_position = infer_cycle_position(ordered_days)
 	extended = list(ordered_days)
 	for step in range(1, FORECAST_DAYS + 1):
@@ -687,7 +714,7 @@ def extend_schedule_with_forecast(days: List[ScheduleDay]) -> List[ScheduleDay]:
 def build_forecast_shifts(days: List[ScheduleDay]) -> List[ScheduleShift]:
 	shifts: List[ScheduleShift] = []
 	for day in days:
-		if day.raw_shift.casefold() == "выходной":
+		if day.raw_shift.casefold() == OFF_DAY_STATUS:
 			continue
 		shifts.append(build_shift(day.employee, day.shift_date, day.raw_shift))
 	return shifts
@@ -698,6 +725,7 @@ def schedule_event_payload(shift: ScheduleShift, source_info: Optional[str]) -> 
 	start_at = shift.start_at.replace(tzinfo=calendar_zoneinfo())
 	end_at = shift.end_at.replace(tzinfo=calendar_zoneinfo())
 	color_id = schedule_shift_color_id(shift.raw_shift)
+	summary_prefix = "Отпуск" if shift.all_day else "Смена"
 	description_lines = [
 		f"Employee: {shift.employee}",
 		f"Shift date: {shift.shift_date.isoformat()}",
@@ -708,14 +736,11 @@ def schedule_event_payload(shift: ScheduleShift, source_info: Optional[str]) -> 
 		description_lines.append(f"SD info: {source_info}")
 	payload = {
 		"id": schedule_event_id(shift.schedule_key),
-		"summary": f"Смена: {shift.employee}",
+		"summary": f"{summary_prefix}: {shift.employee}",
 		"description": "\n".join(description_lines),
 		"start": {"dateTime": start_at.isoformat(), "timeZone": timezone},
 		"end": {"dateTime": end_at.isoformat(), "timeZone": timezone},
-		"reminders": {
-			"useDefault": False,
-			"overrides": [{"method": "popup", "minutes": 10}],
-		},
+		"reminders": {"useDefault": False, "overrides": []},
 		"extendedProperties": {
 			"private": {
 				"source": GCAL_SYNC_SOURCE,
@@ -726,6 +751,12 @@ def schedule_event_payload(shift: ScheduleShift, source_info: Optional[str]) -> 
 			}
 		},
 	}
+	if shift.all_day:
+		payload["start"] = {"date": shift.shift_date.isoformat()}
+		payload["end"] = {"date": (shift.shift_date + timedelta(days=1)).isoformat()}
+		payload["transparency"] = "transparent"
+	else:
+		payload["reminders"]["overrides"] = [{"method": "popup", "minutes": 10}]
 	if color_id:
 		payload["colorId"] = color_id
 	return payload
@@ -829,11 +860,14 @@ def sync_schedule_to_google_calendar(
 		needs_update = any(
 			(
 				(primary.get("summary") or "") != payload["summary"],
-				((primary.get("start") or {}).get("dateTime") or "") != payload["start"]["dateTime"],
-				((primary.get("end") or {}).get("dateTime") or "") != payload["end"]["dateTime"],
+				((primary.get("start") or {}).get("dateTime") or (primary.get("start") or {}).get("date") or "")
+				!= (payload["start"].get("dateTime") or payload["start"].get("date") or ""),
+				((primary.get("end") or {}).get("dateTime") or (primary.get("end") or {}).get("date") or "")
+				!= (payload["end"].get("dateTime") or payload["end"].get("date") or ""),
 				((primary.get("description") or "") != payload["description"]),
 				(primary.get("reminders") or {}) != payload["reminders"],
 				str(primary.get("colorId") or "") != str(payload.get("colorId") or ""),
+				str(primary.get("transparency") or "") != str(payload.get("transparency") or ""),
 				private_props.get("source_info", "") != (source_info or ""),
 			)
 		)
@@ -860,7 +894,7 @@ def sync_schedule_to_google_calendar(
 
 def handle_schedule_message(chat_id: int, text: str) -> None:
 	send_chat_action(chat_id, "typing")
-	shifts, off_days, source_info, schedule_dates, days = parse_schedule_message(text)
+	shifts, off_days, vacation_days, source_info, schedule_dates, days = parse_schedule_message(text)
 	extended_days = extend_schedule_with_forecast(days)
 	forecast_days = extended_days[len(days):]
 	forecast_shifts = build_forecast_shifts(forecast_days)
@@ -881,7 +915,8 @@ def handle_schedule_message(chat_id: int, text: str) -> None:
 		chat_id,
 		"Расписание синхронизировано с Google Calendar.\n"
 		f"Период: {period}\n"
-		f"Смен из сообщения: {len(shifts)}\n"
+		f"Смен из сообщения: {sum(1 for shift in shifts if not shift.all_day)}\n"
+		f"Дней отпуска: {vacation_days}\n"
 		f"Автодобавлено вперёд: {len(forecast_shifts)}\n"
 		f"Выходных пропущено: {off_days}\n"
 		f"Создано: {stats['created']}\n"
@@ -1130,8 +1165,8 @@ def sanitize_filename_component(name: str) -> str:
 def audio_base_name(title: str, artist: str) -> str:
 	artist_part = sanitize_filename_component(artist)
 	title_part = sanitize_filename_component(title)
-    if title_part!="Unknown":
-        return sanitize_name(f"{title_part}")
+	if title_part != "Unknown":
+		return sanitize_name(f"{title_part}")
 	return sanitize_name(f"{artist_part}")
 
 
