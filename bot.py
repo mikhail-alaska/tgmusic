@@ -181,7 +181,6 @@ class ScheduleShift:
 	start_at: datetime
 	end_at: datetime
 	raw_shift: str
-	all_day: bool = False
 
 	@property
 	def schedule_key(self) -> str:
@@ -598,18 +597,6 @@ def build_shift(employee: str, shift_date: date, shift_text: str) -> ScheduleShi
 	)
 
 
-def build_vacation_event(employee: str, shift_date: date, shift_text: str) -> ScheduleShift:
-	start_at = datetime.combine(shift_date, dt_time.min)
-	return ScheduleShift(
-		employee=employee,
-		shift_date=shift_date,
-		start_at=start_at,
-		end_at=start_at + timedelta(days=1),
-		raw_shift=shift_text,
-		all_day=True,
-	)
-
-
 def parse_schedule_message(text: str) -> Tuple[List[ScheduleShift], int, int, Optional[str], List[date], List[ScheduleDay]]:
 	shifts: List[ScheduleShift] = []
 	days: List[ScheduleDay] = []
@@ -645,11 +632,10 @@ def parse_schedule_message(text: str) -> Tuple[List[ScheduleShift], int, int, Op
 			continue
 		if shift_status == VACATION_STATUS:
 			vacation_days += 1
-			shifts.append(build_vacation_event(employee, current_date, shift_text))
 			continue
 		shifts.append(build_shift(employee, current_date, shift_text))
 
-	if not shifts and off_days == 0:
+	if not shifts and off_days == 0 and vacation_days == 0:
 		raise ValueError("No schedule rows were found in the message.")
 	return shifts, off_days, vacation_days, source_info, seen_dates, days
 
@@ -725,7 +711,6 @@ def schedule_event_payload(shift: ScheduleShift, source_info: Optional[str]) -> 
 	start_at = shift.start_at.replace(tzinfo=calendar_zoneinfo())
 	end_at = shift.end_at.replace(tzinfo=calendar_zoneinfo())
 	color_id = schedule_shift_color_id(shift.raw_shift)
-	summary_prefix = "Отпуск" if shift.all_day else "Смена"
 	description_lines = [
 		f"Employee: {shift.employee}",
 		f"Shift date: {shift.shift_date.isoformat()}",
@@ -736,11 +721,14 @@ def schedule_event_payload(shift: ScheduleShift, source_info: Optional[str]) -> 
 		description_lines.append(f"SD info: {source_info}")
 	payload = {
 		"id": schedule_event_id(shift.schedule_key),
-		"summary": f"{summary_prefix}: {shift.employee}",
+		"summary": f"Смена: {shift.employee}",
 		"description": "\n".join(description_lines),
 		"start": {"dateTime": start_at.isoformat(), "timeZone": timezone},
 		"end": {"dateTime": end_at.isoformat(), "timeZone": timezone},
-		"reminders": {"useDefault": False, "overrides": []},
+		"reminders": {
+			"useDefault": False,
+			"overrides": [{"method": "popup", "minutes": 10}],
+		},
 		"extendedProperties": {
 			"private": {
 				"source": GCAL_SYNC_SOURCE,
@@ -751,12 +739,6 @@ def schedule_event_payload(shift: ScheduleShift, source_info: Optional[str]) -> 
 			}
 		},
 	}
-	if shift.all_day:
-		payload["start"] = {"date": shift.shift_date.isoformat()}
-		payload["end"] = {"date": (shift.shift_date + timedelta(days=1)).isoformat()}
-		payload["transparency"] = "transparent"
-	else:
-		payload["reminders"]["overrides"] = [{"method": "popup", "minutes": 10}]
 	if color_id:
 		payload["colorId"] = color_id
 	return payload
@@ -915,7 +897,7 @@ def handle_schedule_message(chat_id: int, text: str) -> None:
 		chat_id,
 		"Расписание синхронизировано с Google Calendar.\n"
 		f"Период: {period}\n"
-		f"Смен из сообщения: {sum(1 for shift in shifts if not shift.all_day)}\n"
+		f"Смен из сообщения: {len(shifts)}\n"
 		f"Дней отпуска: {vacation_days}\n"
 		f"Автодобавлено вперёд: {len(forecast_shifts)}\n"
 		f"Выходных пропущено: {off_days}\n"
